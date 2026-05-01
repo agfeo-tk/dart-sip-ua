@@ -20,6 +20,7 @@ import 'rtc_session/info.dart' as RTCSession_Info;
 import 'rtc_session/info.dart';
 import 'rtc_session/refer_notifier.dart';
 import 'rtc_session/refer_subscriber.dart';
+import 'socket_transport.dart';
 import 'timers.dart';
 import 'transactions/transaction_base.dart';
 import 'ua.dart';
@@ -1196,6 +1197,13 @@ class RTCSession extends EventManager implements Owner {
       return false;
     }
 
+    // Mark as attempting ICE restart so onTransportError() does not terminate
+    // the session when the first RE-INVITE fails on the old (dying) interface.
+    // The CONNECTED handler in VoipService will retry on the new interface.
+    if (rtcOfferConstraints?['mandatory']?['IceRestart'] == true) {
+      _isAttemptingIceRestart = true;
+    }
+
     handlers.on(EventSucceeded(), (EventSucceeded event) {
       if (done != null && event.response != null) {
         done(event.response!);
@@ -1460,11 +1468,19 @@ class RTCSession extends EventManager implements Owner {
   void onTransportError() {
     logger.e('onTransportError()');
     if (_state != RtcSessionState.terminated) {
-      terminate(<String, dynamic>{
-        'status_code': 500,
-        'reason_phrase': DartSIP_C.CausesType.CONNECTION_ERROR,
-        'cause': DartSIP_C.CausesType.CONNECTION_ERROR
-      });
+      if (_isAttemptingIceRestart) {
+        // Transport error is expected here: the RE-INVITE was sent on the old
+        // (dying) interface. sip_ua will reconnect on the new interface and
+        // VoipService's CONNECTED handler will retry the RE-INVITE there.
+        // Do NOT terminate — the call can still be recovered.
+        logger.w('onTransportError() during ICE restart — NOT terminating, waiting for reconnect on new interface.');
+      } else {
+        terminate(<String, dynamic>{
+          'status_code': 500,
+          'reason_phrase': DartSIP_C.CausesType.CONNECTION_ERROR,
+          'cause': DartSIP_C.CausesType.CONNECTION_ERROR
+        });
+      }
     }
   }
 
@@ -1472,11 +1488,19 @@ class RTCSession extends EventManager implements Owner {
     logger.e('onRequestTimeout()');
 
     if (_state != RtcSessionState.terminated) {
-      terminate(<String, dynamic>{
-        'status_code': 408,
-        'reason_phrase': DartSIP_C.CausesType.REQUEST_TIMEOUT,
-        'cause': DartSIP_C.CausesType.REQUEST_TIMEOUT
-      });
+      if (_isAttemptingIceRestart) {
+        // Timer B fired for a RE-INVITE that was sent on the old (dying) interface.
+        // The TCP send "succeeded" but the server got no reachable path back.
+        // The CONNECTED handler has already sent (or will send) a retry on the new
+        // interface — do NOT terminate yet.
+        logger.w('onRequestTimeout() during ICE restart — NOT terminating, waiting for retry on new interface.');
+      } else {
+        terminate(<String, dynamic>{
+          'status_code': 408,
+          'reason_phrase': DartSIP_C.CausesType.REQUEST_TIMEOUT,
+          'cause': DartSIP_C.CausesType.REQUEST_TIMEOUT
+        });
+      }
     }
   }
 
@@ -1643,13 +1667,23 @@ class RTCSession extends EventManager implements Owner {
   }
 
   void _iceRestart() async {
-    Map<String, dynamic> offerConstraints = _rtcOfferConstraints ??
-        <String, dynamic>{
-          'mandatory': <String, dynamic>{},
-          'optional': <dynamic>[],
-        };
-    offerConstraints['mandatory']['IceRestart'] = true;
-    renegotiate(options: offerConstraints);
+    // Pass options with proper structure so renegotiate() computes upgradeToVideo=false
+    // and takes the _sendReinvite() path instead of _sendVideoUpgradeReinvite().
+    // mediaConstraints.video=false is the key: without it upgradeToVideo evaluates to true
+    // on audio-only calls (no video track), causing _sendVideoUpgradeReinvite() to produce
+    // an SDP offer with no ICE candidates (c=IN IP4 0.0.0.0, port 9).
+    final Map<String, dynamic> iceRestartOptions = <String, dynamic>{
+      'mediaConstraints': <String, dynamic>{'audio': true, 'video': false},
+      'rtcOfferConstraints': <String, dynamic>{
+        'mandatory': <String, dynamic>{
+          'IceRestart': true,
+          'OfferToReceiveAudio': true,
+          'OfferToReceiveVideo': false,
+        },
+        'optional': <dynamic>[],
+      },
+    };
+    renegotiate(options: iceRestartOptions);
   }
 
   Future<void> _createRTCConnection(Map<String, dynamic> pcConfig,
@@ -1667,34 +1701,57 @@ class RTCSession extends EventManager implements Owner {
       if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
         logger.e('ICE Connection State Failed.');
         _iceDisconnectTimer?.cancel();
-        terminate(<String, dynamic>{
-          'cause': DartSIP_C.CausesType.RTP_TIMEOUT,
-          'status_code': 408,
-          'reason_phrase': 'ICE Connection Failed'
-        });
+        // If an ICE restart RE-INVITE is already in flight, give it time to
+        // complete before terminating. iOS transitions Disconnected→Failed in
+        // ~10s; the in-flight RE-INVITE may arrive and flip ICE back to
+        // Checking/Connected before the peer replies.
+        if (_isAttemptingIceRestart) {
+          logger.w('ICE Failed but ICE restart is in progress — NOT terminating, waiting for RE-INVITE result.');
+        } else {
+          terminate(<String, dynamic>{
+            'cause': DartSIP_C.CausesType.RTP_TIMEOUT,
+            'status_code': 408,
+            'reason_phrase': 'ICE Connection Failed'
+          });
+        }
       } else if (state ==
           RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
         logger.w('ICE Connection State Disconnected.');
-        if (_iceDisconnectTimer == null && !_isAttemptingIceRestart) {
+        // Set immediately so that terminate() is suppressed while the WebSocket
+        // reconnects and the ICE restart RE-INVITE is in flight.
+        _isAttemptingIceRestart = true;
+        if (_iceDisconnectTimer == null) {
+          // connectivity_plus does not reliably fire on iOS during WiFi↔LTE
+          // switches, so we force a WebSocket reconnect here. By T+2s when
+          // _iceRestart() sends the RE-INVITE, the new socket should be ready.
+          logger.i(
+              'ICE Disconnected: forcing WebSocket reconnect for interface switch recovery.');
+          final SocketTransport? transport = _ua.socketTransport;
+          if (transport != null) {
+            if (transport.isConnected() || transport.isConnecting()) {
+              transport.disconnect();
+            }
+            transport.connect();
+          }
           logger.i('Starting ICE disconnect timer...');
-          _iceDisconnectTimer = Timer(const Duration(seconds: 20), () {
+          // 2s fires before iOS native ICE Disconnected→Failed transition (~10s),
+          // giving the RE-INVITE time to reach the server and flip ICE to Checking.
+          _iceDisconnectTimer = Timer(const Duration(seconds: 2), () {
             logger.w('ICE disconnect timer fired!');
             if (_connection?.iceConnectionState ==
                     RTCIceConnectionState.RTCIceConnectionStateDisconnected &&
                 _state != RtcSessionState.terminated &&
-                _state != RtcSessionState.canceled &&
-                !_isAttemptingIceRestart) {
+                _state != RtcSessionState.canceled) {
               logger.i('Attempting ICE restart after timeout...');
-              _isAttemptingIceRestart = true;
               _iceRestart();
             } else {
-              logger.i('ICE restart aborted (state changed during timer).');
+              logger.i('ICE restart aborted (ICE recovered or session ended).');
+              _isAttemptingIceRestart = false;
             }
             _iceDisconnectTimer = null;
           });
         } else {
-          logger.d(
-              'ICE disconnect timer not started (already running or attempting restart).');
+          logger.d('ICE disconnect timer already running.');
         }
       } else if (state ==
               RTCIceConnectionState.RTCIceConnectionStateConnected ||
@@ -1853,6 +1910,13 @@ class RTCSession extends EventManager implements Owner {
         }
       }
     };
+
+    // Reset gathering state before setLocalDescription so an ICE restart does not
+    // early-return with the stale Complete state from the previous gathering.
+    // After setLocalDescription the Dart event loop may not yet have processed
+    // the native onIceGatheringState(Gathering) callback, so _iceGatheringState
+    // would still read Complete and we would return an SDP with no candidates.
+    _iceGatheringState = RTCIceGatheringState.RTCIceGatheringStateNew;
 
     try {
       await _connection!.setLocalDescription(desc);

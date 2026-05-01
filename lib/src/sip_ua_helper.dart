@@ -18,6 +18,7 @@ import 'options.dart';
 import 'rtc_session.dart';
 import 'rtc_session/refer_subscriber.dart';
 import 'sip_message.dart';
+import 'socket_transport.dart';
 import 'stack_trace_nj.dart';
 import 'subscriber.dart';
 import 'transport_type.dart';
@@ -76,6 +77,29 @@ class SIPUAHelper extends EventManager {
     } else {
       logger.w('ERROR: stop called but not started, call start first.');
     }
+  }
+
+  /// Erzwingt einen WebSocket-Reconnect auf dem aktuellen Netzwerkinterface.
+  ///
+  /// Wenn das Gerät das Netzwerkinterface wechselt (z.B. WiFi → LTE), bleibt
+  /// die alte TCP-Verbindung lautlos tot — sip_ua erkennt das nicht sofort.
+  /// Diese Methode schließt den alten Socket aktiv und öffnet sofort einen neuen,
+  /// damit sip_ua [transportStateChanged(CONNECTED)] auf dem neuen Interface feuert.
+  void reconnectTransport() {
+    if (_ua == null) {
+      logger.w('reconnectTransport: UA not initialized');
+      return;
+    }
+    final SocketTransport? transport = _ua!.socketTransport;
+    if (transport == null) {
+      logger.w('reconnectTransport: no socket transport available');
+      return;
+    }
+    logger.i('reconnectTransport: force-reconnecting WebSocket');
+    if (transport.isConnected() || transport.isConnecting()) {
+      transport.disconnect();
+    }
+    transport.connect();
   }
 
   void register() {
