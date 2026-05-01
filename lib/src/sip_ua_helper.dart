@@ -401,7 +401,11 @@ class SIPUAHelper extends EventManager {
         'tcpCandidatePolicy':
             (_uaSettings?.tcpCandidatePolicy ?? TcpCandidatePolicy.ENABLED)
                 .toParameterString(),
-        'iceCandidatePoolSize': _uaSettings?.iceCandidatePoolSize
+        'iceCandidatePoolSize': _uaSettings?.iceCandidatePoolSize,
+        // Continuously monitor network interfaces: when WiFi→LTE switch happens,
+        // the ICE agent auto-discovers LTE candidates and retries connectivity
+        // checks without needing an ICE restart RE-INVITE.
+        'continualGatheringPolicy': 'gather_continually',
       },
       'mediaConstraints': <String, dynamic>{
         'audio': true,

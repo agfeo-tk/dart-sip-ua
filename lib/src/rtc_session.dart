@@ -1708,19 +1708,13 @@ class RTCSession extends EventManager implements Owner {
       if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
         logger.e('ICE Connection State Failed.');
         _iceDisconnectTimer?.cancel();
-        // If an ICE restart RE-INVITE is already in flight, give it time to
-        // complete before terminating. iOS transitions Disconnected→Failed in
-        // ~10s; the in-flight RE-INVITE may arrive and flip ICE back to
-        // Checking/Connected before the peer replies.
-        if (_isAttemptingIceRestart) {
-          logger.w('ICE Failed but ICE restart is in progress — NOT terminating, waiting for RE-INVITE result.');
-        } else {
-          terminate(<String, dynamic>{
-            'cause': DartSIP_C.CausesType.RTP_TIMEOUT,
-            'status_code': 408,
-            'reason_phrase': 'ICE Connection Failed'
-          });
-        }
+        _iceDisconnectTimer = null;
+        _isAttemptingIceRestart = false;
+        terminate(<String, dynamic>{
+          'cause': DartSIP_C.CausesType.RTP_TIMEOUT,
+          'status_code': 408,
+          'reason_phrase': 'ICE Connection Failed'
+        });
       } else if (state ==
           RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
         logger.w('ICE Connection State Disconnected.');
@@ -1728,9 +1722,9 @@ class RTCSession extends EventManager implements Owner {
         // reconnects and the ICE restart RE-INVITE is in flight.
         _isAttemptingIceRestart = true;
         if (_iceDisconnectTimer == null) {
-          // connectivity_plus does not reliably fire on iOS during WiFi↔LTE
-          // switches, so we force a WebSocket reconnect here. By T+2s when
-          // _iceRestart() sends the RE-INVITE, the new socket should be ready.
+          // Force WebSocket reconnect so SIP transport moves to the new LTE
+          // interface immediately. connectivity_plus does not reliably fire on
+          // iOS, so we trigger the reconnect here from the ICE event.
           logger.i(
               'ICE Disconnected: forcing WebSocket reconnect for interface switch recovery.');
           final SocketTransport? transport = _ua.socketTransport;
@@ -1740,22 +1734,33 @@ class RTCSession extends EventManager implements Owner {
             }
             transport.connect();
           }
-          logger.i('Starting ICE disconnect timer...');
-          // 2s fires before iOS native ICE Disconnected→Failed transition (~10s),
-          // giving the RE-INVITE time to reach the server and flip ICE to Checking.
-          _iceDisconnectTimer = Timer(const Duration(seconds: 2), () {
-            logger.w('ICE disconnect timer fired!');
+          logger.i('Starting ICE recovery timer (12s)...');
+          // 12s fallback: if ICE has not recovered naturally via continuous
+          // gathering by then, terminate the call. No RE-INVITE is sent —
+          // the AGFEO PBX (ice-lite) does not support ICE credential updates,
+          // so IceRestart:true causes STUN auth failure (PBX stores old ufrag).
+          // Without IceRestart, createOffer() returns only the old (dead) WiFi
+          // candidates, so a RE-INVITE with it also fails. Instead we rely on
+          // continualGatheringPolicy=gather_continually: the ICE agent discovers
+          // the new LTE interface automatically, pairs (LTE→PBX) are checked
+          // with the original (unchanged) credentials, PBX verifies → Connected.
+          _iceDisconnectTimer = Timer(const Duration(seconds: 12), () {
+            _iceDisconnectTimer = null;
             if (_connection?.iceConnectionState ==
                     RTCIceConnectionState.RTCIceConnectionStateDisconnected &&
                 _state != RtcSessionState.terminated &&
                 _state != RtcSessionState.canceled) {
-              logger.i('Attempting ICE restart after timeout...');
-              _iceRestart();
+              logger.w('ICE natural recovery timeout — terminating call.');
+              _isAttemptingIceRestart = false;
+              terminate(<String, dynamic>{
+                'cause': DartSIP_C.CausesType.RTP_TIMEOUT,
+                'status_code': 408,
+                'reason_phrase': 'ICE Connection Failed'
+              });
             } else {
-              logger.i('ICE restart aborted (ICE recovered or session ended).');
+              logger.i('ICE recovery timer fired — ICE recovered or session already ended.');
               _isAttemptingIceRestart = false;
             }
-            _iceDisconnectTimer = null;
           });
         } else {
           logger.d('ICE disconnect timer already running.');
