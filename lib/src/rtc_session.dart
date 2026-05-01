@@ -1672,11 +1672,18 @@ class RTCSession extends EventManager implements Owner {
     // mediaConstraints.video=false is the key: without it upgradeToVideo evaluates to true
     // on audio-only calls (no video track), causing _sendVideoUpgradeReinvite() to produce
     // an SDP offer with no ICE candidates (c=IN IP4 0.0.0.0, port 9).
+    //
+    // IceRestart:true is intentionally omitted: the AGFEO PBX (ice-lite) echoes
+    // back the same ICE credentials in its 200 OK answer regardless of the restart
+    // flag. When the app generates new credentials (IceRestart=true) the PBX does
+    // not update its stored remote credentials, so every subsequent STUN binding
+    // request with the new username is rejected → ICE fails after 15 s. Without
+    // the restart flag the existing credentials are reused, LTE candidates are
+    // still gathered and offered, and the PBX verifies STUN correctly.
     final Map<String, dynamic> iceRestartOptions = <String, dynamic>{
       'mediaConstraints': <String, dynamic>{'audio': true, 'video': false},
       'rtcOfferConstraints': <String, dynamic>{
         'mandatory': <String, dynamic>{
-          'IceRestart': true,
           'OfferToReceiveAudio': true,
           'OfferToReceiveVideo': false,
         },
