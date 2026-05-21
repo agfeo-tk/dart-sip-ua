@@ -121,8 +121,18 @@ class RTCSession extends EventManager implements Owner {
   // Flag to indicate PeerConnection ready for actions.
   bool _rtcReady = true;
 
+  // Holds the active completer from _createLocalDescription() so it can be
+  // cancelled (e.g. on WS disconnect during ICE restart) to unlock _rtcReady.
+  Completer<RTCSessionDescription>? _pendingLocalDescCompleter;
+
   Timer? _iceDisconnectTimer;
   bool _isAttemptingIceRestart = false;
+
+  /// Letzte bekannte Remote-ICE-Credentials, gespeichert sobald ICE Connected/Completed
+  /// erreicht wird. Werden genutzt, um Session-Refresh-RE-INVITEs zu erkennen, bei denen
+  /// die PBX neue Credentials liefert, ohne dass ein echter ICE-Restart gewünscht ist.
+  String? _lastRemoteIceUfrag;
+  String? _lastRemoteIcePwd;
 
   // SIP Timers.
   final SIPTimers _timers = SIPTimers();
@@ -169,6 +179,57 @@ class RTCSession extends EventManager implements Owner {
   dynamic get request => _request;
 
   RTCPeerConnection? get connection => _connection;
+
+  /// Marks this session as attempting ICE restart so that a RE-INVITE failure
+  /// does not call terminate(). Use before a proactive RE-INVITE that fires
+  /// while ICE is still Connected (i.e. before ICE Disconnected has fired and
+  /// set this flag automatically).
+  void markIceRestartInProgress() {
+    _isAttemptingIceRestart = true;
+  }
+
+  /// Cancels the ICE-Disconnect timer without terminating the session.
+  /// Called by VoipService when WS reconnects and a RE-INVITE is about to be
+  /// sent — prevents a race where the 12s timer fires milliseconds before the
+  /// RE-INVITE can be sent.
+  void cancelIceDisconnectTimer() {
+    _iceDisconnectTimer?.cancel();
+    _iceDisconnectTimer = null;
+  }
+
+  /// Extrahiert den ICE-ufrag-Wert aus einem SDP-String.
+  String? _extractIceUfrag(String? sdp) {
+    if (sdp == null) { return null; }
+    final match = RegExp(r'a=ice-ufrag:(\S+)').firstMatch(sdp);
+    return match?.group(1);
+  }
+
+  /// Extrahiert den ICE-pwd-Wert aus einem SDP-String.
+  String? _extractIcePwd(String? sdp) {
+    if (sdp == null) { return null; }
+    final match = RegExp(r'a=ice-pwd:(\S+)').firstMatch(sdp);
+    return match?.group(1);
+  }
+
+  /// Ersetzt alle ICE-ufrag- und ice-pwd-Zeilen im SDP durch die übergebenen
+  /// bekannten Credentials. Wird verwendet, um einen ungewollten ICE-Restart zu
+  /// verhindern, wenn die PBX bei einem Session-Refresh neue Credentials liefert.
+  ///
+  /// @param sdp    Original-SDP vom Remote-Peer.
+  /// @param ufrag  Zu verwendender ICE-ufrag (letzte bekannte Credentials).
+  /// @param pwd    Zu verwendender ICE-pwd (letzte bekannte Credentials).
+  /// @return SDP mit ersetzten ICE-Credentials.
+  String _patchRemoteIceCredentials(String sdp, String ufrag, String pwd) {
+    String patched = sdp.replaceAll(
+      RegExp(r'a=ice-ufrag:\S+'),
+      'a=ice-ufrag:$ufrag',
+    );
+    patched = patched.replaceAll(
+      RegExp(r'a=ice-pwd:\S+'),
+      'a=ice-pwd:$pwd',
+    );
+    return patched;
+  }
 
   @override
   int get TerminatedCode => RtcSessionState.terminated.index;
@@ -1164,7 +1225,8 @@ class RTCSession extends EventManager implements Owner {
   bool renegotiate(
       {Map<String, dynamic>? options,
       bool useUpdate = false,
-      Function(IncomingMessage?)? done}) {
+      Function(IncomingMessage?)? done,
+      Function()? onFailed}) {
     logger.d('renegotiate()');
 
     options = options ?? <String, dynamic>{};
@@ -1197,13 +1259,6 @@ class RTCSession extends EventManager implements Owner {
       return false;
     }
 
-    // Mark as attempting ICE restart so onTransportError() does not terminate
-    // the session when the first RE-INVITE fails on the old (dying) interface.
-    // The CONNECTED handler in VoipService will retry on the new interface.
-    if (rtcOfferConstraints?['mandatory']?['IceRestart'] == true) {
-      _isAttemptingIceRestart = true;
-    }
-
     handlers.on(EventSucceeded(), (EventSucceeded event) {
       if (done != null && event.response != null) {
         done(event.response!);
@@ -1211,6 +1266,14 @@ class RTCSession extends EventManager implements Owner {
     });
 
     handlers.on(EventCallFailed(), (EventCallFailed event) {
+      if (_isAttemptingIceRestart) {
+        // RE-INVITE failed during ICE recovery (e.g. PBX responded 500 or WS
+        // dropped). Do NOT terminate — notify VoipService so it can cancel the
+        // 2s WS-reconnect timer and let ICE events drive the next retry.
+        logger.w('[REINVITE] [ICE] renegotiate: RE-INVITE failed during ICE restart — not terminating session');
+        onFailed?.call();
+        return;
+      }
       terminate(<String, dynamic>{
         'cause': DartSIP_C.CausesType.WEBRTC_ERROR,
         'status_code': 500,
@@ -1465,15 +1528,35 @@ class RTCSession extends EventManager implements Owner {
   /**
    * Session Callbacks
    */
+  /// Cancels a pending _createLocalDescription() call if one is in progress.
+  /// This resets _rtcReady to true so the next RE-INVITE attempt (after the
+  /// WebSocket reconnects) is not blocked by the stale _rtcReady=false state.
+  void _cancelPendingLocalDescription() {
+    if (!_rtcReady && _pendingLocalDescCompleter != null) {
+      logger.w('[ICE] _cancelPendingLocalDescription() — cancelling pending createLocalDescription()');
+      _connection?.onIceCandidate = null;
+      _connection?.onIceGatheringState = null;
+      _rtcReady = true;
+      if (!_pendingLocalDescCompleter!.isCompleted) {
+        _pendingLocalDescCompleter!.completeError(
+            'createLocalDescription cancelled — WS disconnect during ICE restart');
+      }
+      _pendingLocalDescCompleter = null;
+    }
+  }
+
   void onTransportError() {
-    logger.e('onTransportError()');
+    logger.e('[WS] onTransportError()');
     if (_state != RtcSessionState.terminated) {
       if (_isAttemptingIceRestart) {
         // Transport error is expected here: the RE-INVITE was sent on the old
         // (dying) interface. sip_ua will reconnect on the new interface and
         // VoipService's CONNECTED handler will retry the RE-INVITE there.
         // Do NOT terminate — the call can still be recovered.
-        logger.w('onTransportError() during ICE restart — NOT terminating, waiting for reconnect on new interface.');
+        logger.w('[WS] [ICE] onTransportError() during ICE restart — NOT terminating, waiting for reconnect on new interface.');
+        // If _createLocalDescription() is still pending, cancel it so that
+        // _rtcReady is reset to true before the next reconnect attempt.
+        _cancelPendingLocalDescription();
       } else {
         terminate(<String, dynamic>{
           'status_code': 500,
@@ -1485,15 +1568,14 @@ class RTCSession extends EventManager implements Owner {
   }
 
   void onRequestTimeout() {
-    logger.e('onRequestTimeout()');
+    logger.e('[WS] onRequestTimeout()');
 
     if (_state != RtcSessionState.terminated) {
       if (_isAttemptingIceRestart) {
-        // Timer B fired for a RE-INVITE that was sent on the old (dying) interface.
-        // The TCP send "succeeded" but the server got no reachable path back.
-        // The CONNECTED handler has already sent (or will send) a retry on the new
-        // interface — do NOT terminate yet.
-        logger.w('onRequestTimeout() during ICE restart — NOT terminating, waiting for retry on new interface.');
+        // Timer B fired for a RE-INVITE during ICE restart. The transaction is
+        // now freed → _isReadyToReOffer() = true. _sendReinvite emits
+        // EventCallFailed after this call so VoipService.onFailed can retry.
+        logger.w('[ICE] [SESSION] onRequestTimeout() during ICE restart — NOT terminating, EventCallFailed triggers retry.');
       } else {
         terminate(<String, dynamic>{
           'status_code': 408,
@@ -1666,21 +1748,38 @@ class RTCSession extends EventManager implements Owner {
     }, Timers.TIMER_H);
   }
 
+  /// Startet (oder setzt zurück) den 30-s-Notfall-Timer für ICE-Recovery.
+  /// Wird sowohl beim ersten ICE-Failed als auch beim Start jedes
+  /// ICE-Restart-RE-INVITEs aufgerufen, damit jede Verhandlungsrunde ein
+  /// eigenes 30-s-Fenster bekommt.
+  void _startEmergencyIceTimer() {
+    _iceDisconnectTimer?.cancel();
+    _iceDisconnectTimer = Timer(const Duration(seconds: 30), () {
+      _iceDisconnectTimer = null;
+      final RTCIceConnectionState? iceState = _connection?.iceConnectionState;
+      if (iceState != RTCIceConnectionState.RTCIceConnectionStateConnected &&
+          iceState != RTCIceConnectionState.RTCIceConnectionStateCompleted &&
+          _state != RtcSessionState.terminated &&
+          _state != RtcSessionState.canceled) {
+        logger.w('[ICE] Notfall-Timer (30 s): kein Recovery nach Failed — terminiere.');
+        _isAttemptingIceRestart = false;
+        terminate(<String, dynamic>{
+          'cause': DartSIP_C.CausesType.RTP_TIMEOUT,
+          'status_code': 408,
+          'reason_phrase': 'ICE Connection Failed'
+        });
+      } else {
+        logger.i('[ICE] Notfall-Timer: ICE erholt oder Session schon beendet.');
+        _isAttemptingIceRestart = false;
+      }
+    });
+  }
+
   void _iceRestart() async {
-    // Pass options with proper structure so renegotiate() computes upgradeToVideo=false
-    // and takes the _sendReinvite() path instead of _sendVideoUpgradeReinvite().
-    // mediaConstraints.video=false is the key: without it upgradeToVideo evaluates to true
-    // on audio-only calls (no video track), causing _sendVideoUpgradeReinvite() to produce
-    // an SDP offer with no ICE candidates (c=IN IP4 0.0.0.0, port 9).
-    //
-    // IceRestart:true is intentionally omitted: the AGFEO PBX (ice-lite) echoes
-    // back the same ICE credentials in its 200 OK answer regardless of the restart
-    // flag. When the app generates new credentials (IceRestart=true) the PBX does
-    // not update its stored remote credentials, so every subsequent STUN binding
-    // request with the new username is rejected → ICE fails after 15 s. Without
-    // the restart flag the existing credentials are reused, LTE candidates are
-    // still gathered and offered, and the PBX verifies STUN correctly.
-    final Map<String, dynamic> iceRestartOptions = <String, dynamic>{
+    // mediaConstraints.video=false prevents renegotiate() from computing
+    // upgradeToVideo=true on audio-only calls (no video track), which would
+    // call _sendVideoUpgradeReinvite() and produce an SDP with no candidates.
+    renegotiate(options: <String, dynamic>{
       'mediaConstraints': <String, dynamic>{'audio': true, 'video': false},
       'rtcOfferConstraints': <String, dynamic>{
         'mandatory': <String, dynamic>{
@@ -1689,8 +1788,7 @@ class RTCSession extends EventManager implements Owner {
         },
         'optional': <dynamic>[],
       },
-    };
-    renegotiate(options: iceRestartOptions);
+    });
   }
 
   Future<void> _createRTCConnection(Map<String, dynamic> pcConfig,
@@ -1706,59 +1804,81 @@ class RTCSession extends EventManager implements Owner {
       }
 
       if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
-        logger.e('ICE Connection State Failed.');
-        _iceDisconnectTimer?.cancel();
-        _iceDisconnectTimer = null;
-        _isAttemptingIceRestart = false;
-        terminate(<String, dynamic>{
-          'cause': DartSIP_C.CausesType.RTP_TIMEOUT,
-          'status_code': 408,
-          'reason_phrase': 'ICE Connection Failed'
-        });
+        logger.e('[ICE] Connection State Failed.');
+        if (_isAttemptingIceRestart) {
+          // Notify VoipService so it can log or take action.
+          logger.w('[ICE] Failed during ICE restart attempt — emitting EventIceFailed, deferring termination by 30s.');
+          emit(EventIceFailed(session: this));
+          // _startEmergencyIceTimer() cancels any prior timer internally.
+          _startEmergencyIceTimer();
+        } else {
+          _iceDisconnectTimer?.cancel();
+          _iceDisconnectTimer = null;
+          _isAttemptingIceRestart = false;
+          terminate(<String, dynamic>{
+            'cause': DartSIP_C.CausesType.RTP_TIMEOUT,
+            'status_code': 408,
+            'reason_phrase': 'ICE Connection Failed'
+          });
+        }
+      } else if (state == RTCIceConnectionState.RTCIceConnectionStateChecking) {
+        logger.i('[ICE] Connection State Checking...');
       } else if (state ==
           RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
-        logger.w('ICE Connection State Disconnected.');
-        // Set immediately so that terminate() is suppressed while the WebSocket
-        // reconnects and the ICE restart RE-INVITE is in flight.
+        logger.w('[ICE] Connection State Disconnected.');
+        // Set immediately so that terminate() is suppressed while the RE-INVITE
+        // is in flight and possibly also during a WS reconnect cycle.
         _isAttemptingIceRestart = true;
+        // Cancel any pending createLocalDescription() (e.g. from a concurrent
+        // session-timer refresh that fired just before the ICE disconnect) so
+        // that _rtcReady is unlocked before the ICE restart RE-INVITE fires.
+        _cancelPendingLocalDescription();
         if (_iceDisconnectTimer == null) {
-          // Force WebSocket reconnect so SIP transport moves to the new LTE
-          // interface immediately. connectivity_plus does not reliably fire on
-          // iOS, so we trigger the reconnect here from the ICE event.
-          logger.i(
-              'ICE Disconnected: forcing WebSocket reconnect for interface switch recovery.');
+          // Beim Netzwerk-Interface-Wechsel (WiFi → 5G) ist der alte WS-Socket
+          // lautlos tot: sip_ua erkennt das nicht von selbst (kein TCP-RST).
+          // WS sofort trennen und auf dem neuen Interface neu verbinden, damit
+          // VoipService's CONNECTED-Handler das RE-INVITE über 5G senden kann.
+          // Gleichzeitig EventIceDisconnected emittieren als 500ms-Fallback.
           final SocketTransport? transport = _ua.socketTransport;
           if (transport != null) {
+            logger.i('[ICE] Disconnected — WS-Reconnect erzwingen für Interface-Switch-Recovery.');
             if (transport.isConnected() || transport.isConnecting()) {
               transport.disconnect();
             }
             transport.connect();
           }
-          logger.i('Starting ICE recovery timer (12s)...');
-          // 12s fallback: if ICE has not recovered naturally via continuous
-          // gathering by then, terminate the call. No RE-INVITE is sent —
-          // the AGFEO PBX (ice-lite) does not support ICE credential updates,
-          // so IceRestart:true causes STUN auth failure (PBX stores old ufrag).
-          // Without IceRestart, createOffer() returns only the old (dead) WiFi
-          // candidates, so a RE-INVITE with it also fails. Instead we rely on
-          // continualGatheringPolicy=gather_continually: the ICE agent discovers
-          // the new LTE interface automatically, pairs (LTE→PBX) are checked
-          // with the original (unchanged) credentials, PBX verifies → Connected.
+          logger.i('[ICE] Disconnected — emitting EventIceDisconnected.');
+          emit(EventIceDisconnected(session: this));
+
+          logger.i('[ICE] Starting ICE recovery timer (12s)...');
           _iceDisconnectTimer = Timer(const Duration(seconds: 12), () {
             _iceDisconnectTimer = null;
-            if (_connection?.iceConnectionState ==
+            final RTCIceConnectionState? iceState =
+                _connection?.iceConnectionState;
+            if (iceState ==
                     RTCIceConnectionState.RTCIceConnectionStateDisconnected &&
                 _state != RtcSessionState.terminated &&
                 _state != RtcSessionState.canceled) {
-              logger.w('ICE natural recovery timeout — terminating call.');
+              logger.w('[ICE] Natural recovery timeout — terminating call.');
               _isAttemptingIceRestart = false;
               terminate(<String, dynamic>{
                 'cause': DartSIP_C.CausesType.RTP_TIMEOUT,
                 'status_code': 408,
                 'reason_phrase': 'ICE Connection Failed'
               });
+            } else if (iceState ==
+                    RTCIceConnectionState.RTCIceConnectionStateChecking ||
+                iceState ==
+                    RTCIceConnectionState.RTCIceConnectionStateNew) {
+              // ICE is still actively negotiating — do NOT clear _isAttemptingIceRestart.
+              // The Failed handler must still see it true to grant the 5s grace period.
+              // The Connected/Completed or Failed handler will clean up.
+              logger.i(
+                  '[ICE] Recovery timer fired — ICE still $iceState, keeping restart flag active.');
             } else {
-              logger.i('ICE recovery timer fired — ICE recovered or session already ended.');
+              // Connected, Completed, Failed (already handled), Closed, or session ended.
+              logger.i(
+                  '[ICE] Recovery timer fired — ICE $iceState or session ended.');
               _isAttemptingIceRestart = false;
             }
           });
@@ -1768,24 +1888,36 @@ class RTCSession extends EventManager implements Owner {
       } else if (state ==
               RTCIceConnectionState.RTCIceConnectionStateConnected ||
           state == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
-        // If connection recovers, cancel timer and reset flag
+        // If connection recovers, cancel timer and reset flags
         if (_iceDisconnectTimer != null || _isAttemptingIceRestart) {
           logger.i(
-              'ICE Connection State Connected/Completed. Canceling timer/resetting flag.');
+              '[ICE] Connection State Connected/Completed. Canceling timer/resetting flag.');
           _iceDisconnectTimer?.cancel();
           _isAttemptingIceRestart = false;
         } else {
-          logger.i('ICE Connection State Connected/Completed.');
+          logger.i('[ICE] Connection State Connected/Completed.');
         }
+        // Speichere Remote-ICE-Credentials für spätere Session-Refresh-Erkennung.
+        // Die AGFEO PBX liefert bei jedem RE-INVITE 200 OK neue Credentials — ohne
+        // diesen Snapshot würde setRemoteDescription einen ungewollten ICE-Restart auslösen.
+        _connection?.getRemoteDescription().then((remoteDesc) {
+          final ufrag = _extractIceUfrag(remoteDesc?.sdp);
+          final pwd = _extractIcePwd(remoteDesc?.sdp);
+          if (ufrag != null && pwd != null) {
+            _lastRemoteIceUfrag = ufrag;
+            _lastRemoteIcePwd = pwd;
+            logger.d('[ICE] Remote-ICE-Credentials gespeichert: ufrag=$ufrag');
+          }
+        });
       } else if (state == RTCIceConnectionState.RTCIceConnectionStateClosed) {
         // Connection closed locally, usually via _connection.close() called by terminate()
-        logger.i('ICE Connection State Closed.'); // Use logger.i
+        logger.i('[ICE] Connection State Closed.');
         _iceDisconnectTimer?.cancel(); // Ensure timer is cancelled
         // Ensure *SIP* session state reflects closure if not already set by terminate()
         if (_state != RtcSessionState.terminated &&
             _state != RtcSessionState.canceled) {
           logger.w(
-              'ICE closed but SIP session state was not terminal. Terminating SIP session now.');
+              '[ICE] Closed but SIP session state was not terminal. Terminating SIP session now.');
           terminate(<String, dynamic>{
             'cause': DartSIP_C.CausesType.WEBRTC_ERROR,
             'status_code': 487,
@@ -1793,9 +1925,9 @@ class RTCSession extends EventManager implements Owner {
           });
         }
       } else if (state == RTCIceConnectionState.RTCIceConnectionStateChecking) {
-        logger.d('ICE Connection State Checking...'); // Use logger.d
+        logger.d('[ICE] Connection State Checking...');
       } else if (state == RTCIceConnectionState.RTCIceConnectionStateNew) {
-        logger.d('ICE Connection State New.'); // Use logger.d
+        logger.d('[ICE] Connection State New.');
       }
     };
     // In future versions, unified-plan will be used by default
@@ -1834,6 +1966,7 @@ class RTCSession extends EventManager implements Owner {
     _iceGatheringState ??= RTCIceGatheringState.RTCIceGatheringStateNew;
     Completer<RTCSessionDescription> completer =
         Completer<RTCSessionDescription>();
+    _pendingLocalDescCompleter = completer;
 
     constraints = constraints ??
         <String, dynamic>{
@@ -1845,7 +1978,30 @@ class RTCSession extends EventManager implements Owner {
         modifiers = constraints['offerModifiers'] ??
             <Future<RTCSessionDescription> Function(RTCSessionDescription)>[];
 
-    constraints['offerModifiers'] = null;
+    // Use a shallow copy for the WebRTC call so the caller's constraints object
+    // (e.g. _rtcOfferConstraints) is not mutated. Without this, the first
+    // _createLocalDescription call would set _rtcOfferConstraints['offerModifiers']
+    // to null, causing every subsequent RE-INVITE (session timer, etc.) to lose
+    // its offerModifiers and send unfiltered SDPs.
+    final Map<String, dynamic> webrtcConstraints =
+        Map<String, dynamic>.from(constraints)..['offerModifiers'] = null;
+
+    // Detect ICE restart before setting up callbacks so the gathering timeout
+    // can be extended. TURN relay allocation (needed for NAT/firewall traversal
+    // on cellular) takes 1–2 s longer than STUN srflx — 4× the normal timeout
+    // (default 2 s) gives relay candidates time to arrive before the SDP is sent.
+    final dynamic _iceRestartMandatory = webrtcConstraints['mandatory'];
+    final bool isIceRestart = webrtcConstraints['iceRestart'] == true ||
+        (_iceRestartMandatory is Map &&
+            (_iceRestartMandatory['iceRestart'] == true ||
+                _iceRestartMandatory['IceRestart'] == true));
+    final int effectiveGatheringTimeout = isIceRestart
+        ? ua.configuration.ice_gathering_timeout * 4
+        : ua.configuration.ice_gathering_timeout;
+    if (isIceRestart) {
+      logger.d('createLocalDescription() | ICE restart: using extended gathering timeout '
+          '(${effectiveGatheringTimeout}ms) to allow TURN relay allocation.');
+    }
 
     if (type != SdpType.offer && type != SdpType.answer) {
       completer.completeError(Exceptions.TypeError(
@@ -1856,7 +2012,7 @@ class RTCSession extends EventManager implements Owner {
     late RTCSessionDescription desc;
     if (type == SdpType.offer) {
       try {
-        desc = await _connection!.createOffer(constraints);
+        desc = await _connection!.createOffer(webrtcConstraints);
       } catch (error) {
         logger.e(
             'emit "peerconnection:createofferfailed" [error:${error.toString()}]');
@@ -1865,7 +2021,7 @@ class RTCSession extends EventManager implements Owner {
       }
     } else {
       try {
-        desc = await _connection!.createAnswer(constraints);
+        desc = await _connection!.createAnswer(webrtcConstraints);
       } catch (error) {
         logger.e(
             'emit "peerconnection:createanswerfailed" [error:${error.toString()}]');
@@ -1889,11 +2045,14 @@ class RTCSession extends EventManager implements Owner {
         _connection!.onIceGatheringState = null;
         _iceGatheringState = RTCIceGatheringState.RTCIceGatheringStateComplete;
         _rtcReady = true;
+        _pendingLocalDescCompleter = null;
         RTCSessionDescription? desc = await _connection!.getLocalDescription();
         logger.d('emit "sdp"');
         emit(
             EventSdp(originator: Originator.local, type: type, sdp: desc!.sdp));
-        completer.complete(desc);
+        if (!completer.isCompleted) {
+          completer.complete(desc);
+        }
       }
     }
 
@@ -1910,14 +2069,8 @@ class RTCSession extends EventManager implements Owner {
         emit(EventIceCandidate(candidate, ready));
         if (!hasCandidate) {
           hasCandidate = true;
-          /**
-           *  Just wait for 0.5 seconds. In the case of multiple network connections,
-           *  the RTCIceGatheringStateComplete event needs to wait for 10 ~ 30 seconds.
-           *  Because trickle ICE is not defined in the sip protocol, the delay of
-           * initiating a call to answer the call waiting will be unacceptable.
-           */
-          if (ua.configuration.ice_gathering_timeout != 0) {
-            setTimeout(() => ready(), ua.configuration.ice_gathering_timeout);
+          if (effectiveGatheringTimeout != 0) {
+            setTimeout(() => ready(), effectiveGatheringTimeout);
           }
         }
       }
@@ -1938,6 +2091,50 @@ class RTCSession extends EventManager implements Owner {
           'emit "peerconnection:setlocaldescriptionfailed" [error:${error.toString()}]');
       emit(EventSetLocalDescriptionFailed(exception: error));
       completer.completeError(error);
+    }
+
+    // With gather_continually, the native ICE gathering state stays Complete when
+    // ICE credentials have not changed. setLocalDescription() triggers no new
+    // gathering transition, so _iceGatheringState stays New and no
+    // onIceGatheringState callback will ever fire. The offer SDP from createOffer()
+    // already contains all currently-gathered candidates — return immediately
+    // rather than waiting forever for a callback that will never come.
+    //
+    // ICE restart (iceRestart/IceRestart: true) is an exception: credentials
+    // changed and the native ICE agent resets candidate gathering. Returning
+    // immediately here would send an offer with ZERO candidates — connectivity
+    // checks would fail. Fall through to completer.future so we wait for the
+    // onIceGatheringState(complete) / onIceCandidate + effectiveGatheringTimeout
+    // callbacks that fire after gathering on the new interface completes.
+    // (isIceRestart is detected near the top of this function.)
+
+    if (_iceGatheringState == RTCIceGatheringState.RTCIceGatheringStateNew &&
+        !completer.isCompleted &&
+        !isIceRestart) {
+      logger.d(
+          'createLocalDescription() | no gathering state transition after setLocalDescription — returning immediately (gather_continually)');
+      await ready();
+      return completer.future;
+    }
+
+    // Safety timeout for ICE restart: if the interface is completely down and
+    // no candidates arrive, don't block indefinitely — send with whatever was
+    // gathered (possibly empty). The retry logic in VoipService will try again.
+    // Must be > effectiveGatheringTimeout so a late-arriving first candidate
+    // still triggers the candidate timer rather than the safety timer.
+    if (isIceRestart && !completer.isCompleted) {
+      final int safetyMs = effectiveGatheringTimeout != 0
+          ? effectiveGatheringTimeout + ua.configuration.ice_gathering_timeout * 2
+          : 3000;
+      logger.d(
+          'createLocalDescription() | ICE restart — waiting up to ${safetyMs}ms for candidates on new interface');
+      setTimeout(() {
+        if (!completer.isCompleted) {
+          logger.w(
+              'createLocalDescription() | ICE restart safety timeout (${safetyMs}ms) — sending with current candidates');
+          ready();
+        }
+      }, safetyMs);
     }
 
     // Resolve right away if 'pc.iceGatheringState' is 'complete'.
@@ -2736,9 +2933,11 @@ class RTCSession extends EventManager implements Owner {
           _connection!.signalingState ==
               RTCSignalingState.RTCSignalingStateHaveLocalOffer) {
         try {
-          RTCSessionDescription offer =
-              await _connection!.createOffer(_rtcOfferConstraints!);
-          await _connection!.setLocalDescription(offer);
+          // Use _createLocalDescription() instead of createOffer() directly so
+          // that offerModifiers (Dart closures) are extracted before the native
+          // MethodChannel call. Passing _rtcOfferConstraints directly to
+          // createOffer() would serialize the closures and throw ArgumentError.
+          await _createLocalDescription(SdpType.offer, _rtcOfferConstraints);
         } catch (error) {
           _acceptAndTerminate(response, 500, error.toString());
           _failed(
@@ -2835,11 +3034,65 @@ class RTCSession extends EventManager implements Owner {
         sdp: response.body,
       ));
 
+      // Bei einem Session-Refresh-RE-INVITE (kein expliziter ICE-Restart) liefert
+      // die AGFEO PBX im 200 OK immer neue ICE-Credentials. Das würde WebRTC zu
+      // einem vollständigen ICE-Restart veranlassen (~15 s Audioausfall + iOS CallKit
+      // Timeout). Wenn _isAttemptingIceRestart nicht gesetzt ist, werden die alten
+      // Credentials in die Answer-SDP zurückgeschrieben, bevor sie an WebRTC übergeben
+      // wird, damit kein ICE-Restart ausgelöst wird.
+      String? patchedSdpBody = response.body;
+      if (!_isAttemptingIceRestart &&
+          _lastRemoteIceUfrag != null &&
+          _lastRemoteIcePwd != null) {
+        final answerUfrag = _extractIceUfrag(patchedSdpBody);
+        if (answerUfrag != null && answerUfrag != _lastRemoteIceUfrag) {
+          logger.i('[ICE] Session-Refresh RE-INVITE: PBX lieferte neue ICE-Credentials '
+              '(ufrag: $answerUfrag → $_lastRemoteIceUfrag). '
+              'Patche SDP um ICE-Restart zu verhindern.');
+          patchedSdpBody = _patchRemoteIceCredentials(
+              patchedSdpBody!, _lastRemoteIceUfrag!, _lastRemoteIcePwd!);
+        }
+      }
+
       RTCSessionDescription answer =
-          RTCSessionDescription(response.body, SdpType.answer.name);
+          RTCSessionDescription(patchedSdpBody, SdpType.answer.name);
+
+      // Die AGFEO PBX liefert bei jedem ICE-Restart-RE-INVITE dieselben Remote-ICE-Credentials
+      // (z. B. LWVKL8aHeKyavbmf). Auf iOS erkennt der WebRTC-Stack keine Änderung der Remote-
+      // Credentials und startet keine neuen Connectivity-Checks.
+      // restartIce() setzt den ICE-Agent-Zustand zurück, sodass setRemoteDescription()
+      // anschließend einen frischen Checking-Zustand mit den neuen lokalen Kandidaten startet.
+      // Wird bei Failed UND Checking ausgelöst: Bei mehrfachen Interface-Wechseln (z. B.
+      // WiFi→5G→WiFi) läuft ICE bereits in Checking mit 5G-Kandidaten, wenn die WiFi-
+      // RE-INVITE antwortet. restartIce() verwirft die 5G-Paare und startet neu mit
+      // den aktuellen WiFi-TURN-Kandidaten.
+      if (_isAttemptingIceRestart) {
+        final iceState = _connection?.iceConnectionState;
+        if (iceState == RTCIceConnectionState.RTCIceConnectionStateFailed ||
+            iceState == RTCIceConnectionState.RTCIceConnectionStateChecking) {
+          logger.i('[ICE] restartIce() vor setRemoteDescription — ICE ist $iceState, '
+              'erzwinge Reset des ICE-Agent (gleiche Remote-Credentials, neues Interface).');
+          await _connection?.restartIce();
+        }
+      }
 
       try {
         await _connection!.setRemoteDescription(answer);
+        // Wenn _isAttemptingIceRestart gesetzt ist und ICE bereits Connected/Completed
+        // bleibt (kein Zustandswechsel → kein ICE-Event), wird das Flag hier zurückgesetzt.
+        // Tritt auf wenn ein Interface-Switch RE-INVITE erfolgreich abgeschlossen wird ohne
+        // dass ICE aus dem Connected-Zustand herausgegangen ist.
+        if (_isAttemptingIceRestart) {
+          final iceState = _connection?.iceConnectionState;
+          if (iceState == RTCIceConnectionState.RTCIceConnectionStateConnected ||
+              iceState == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
+            logger.i('[ICE] RE-INVITE erfolgreich, ICE bleibt $iceState — '
+                'setze _isAttemptingIceRestart zurück (kein ICE-State-Event erwartet).');
+            _isAttemptingIceRestart = false;
+            _iceDisconnectTimer?.cancel();
+            _iceDisconnectTimer = null;
+          }
+        }
         eventHandlers.emit(EventSucceeded(response: response));
       } catch (error) {
         onFailed();
@@ -2850,6 +3103,20 @@ class RTCSession extends EventManager implements Owner {
     }
 
     try {
+      // Wenn ein ICE-Restart-RE-INVITE gesendet wird während _isAttemptingIceRestart
+      // gesetzt ist, bekommt die neue ICE-Verhandlungsrunde ein eigenes 30-s-Fenster.
+      // Ohne Reset würde der beim ersten ICE-Failed gestartete Notfall-Timer mitten
+      // in den Connectivity-Checks der nächsten Runde ablaufen.
+      if (_isAttemptingIceRestart) {
+        final dynamic mandatory = rtcOfferConstraints?['mandatory'];
+        final bool isIceRestartOffer = mandatory is Map &&
+            (mandatory['IceRestart'] == true || mandatory['iceRestart'] == true);
+        if (isIceRestartOffer) {
+          logger.i('[ICE] RE-INVITE mit IceRestart — Notfall-Timer zurücksetzen (30 s ab jetzt).');
+          _startEmergencyIceTimer();
+        }
+      }
+
       RTCSessionDescription desc =
           await _createLocalDescription(SdpType.offer, rtcOfferConstraints);
       String? sdp = _mangleOffer(desc.sdp);
@@ -2869,7 +3136,13 @@ class RTCSession extends EventManager implements Owner {
         onTransportError(); // Do nothing because session ends.
       });
       handlers.on(EventOnRequestTimeout(), (EventOnRequestTimeout event) {
-        onRequestTimeout(); // Do nothing because session ends.
+        onRequestTimeout();
+        // Timer B hat die Transaktion freigegeben → _isReadyToReOffer() ist
+        // jetzt true. EventCallFailed emittieren damit VoipService.onFailed
+        // sofort einen neuen RE-INVITE mit frischen Kandidaten senden kann.
+        if (_isAttemptingIceRestart) {
+          eventHandlers.emit(EventCallFailed(session: this, response: null));
+        }
       });
       handlers.on(EventOnDialogError(), (EventOnDialogError event) {
         onDialogError(); // Do nothing because session ends.
@@ -3378,8 +3651,16 @@ class RTCSession extends EventManager implements Owner {
         Duration(milliseconds: delayMs),
         (_) {
           if (_state == RtcSessionState.terminated) return;
+          // Skip session refresh while an ICE restart RE-INVITE is in flight.
+          // The ICE restart RE-INVITE carries Session-Expires and keeps the
+          // session alive. Firing here would steal _rtcReady and block the
+          // ICE restart RE-INVITE from VoipService.
+          if (_isAttemptingIceRestart) {
+            logger.d('[SESSION] runSessionTimer() | skipping refresh during ICE restart');
+            return;
+          }
           logger.d(
-              'runSessionTimer() | sending session refresh request with expires=$expires, delayMs=$delayMs');
+              '[SESSION] runSessionTimer() | sending session refresh request with expires=$expires, delayMs=$delayMs');
           if (_sessionTimers.refreshMethod == SipMethod.UPDATE) {
             _sendUpdate();
           } else {
@@ -3395,7 +3676,7 @@ class RTCSession extends EventManager implements Owner {
           return;
         }
 
-        logger.e('runSessionTimer() | timer expired, terminating the session');
+        logger.e('[SESSION] runSessionTimer() | timer expired, terminating the session');
 
         terminate(<String, dynamic>{
           'cause': DartSIP_C.CausesType.REQUEST_TIMEOUT,
