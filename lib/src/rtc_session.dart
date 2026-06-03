@@ -2612,12 +2612,22 @@ class RTCSession extends EventManager implements Owner {
       RTCSessionDescription answer =
           RTCSessionDescription(response.body, SdpType.answer.name);
 
-      try {
-        await _connection!.setRemoteDescription(answer);
-      } catch (error) {
-        logger.e(
-            'emit "peerconnection:setremotedescriptionfailed" [error:${error.toString()}]');
-        emit(EventSetRemoteDescriptionFailed(exception: error));
+      // Guard: Wenn die PeerConnection bereits im Zustand "stable" ist, wurde die
+      // Verbindung bereits durch eine frühere SDP-Aushandlung (z.B. 200 OK) aufgebaut.
+      // Eine verspätete provisorische Antwort (180/183) würde setRemoteDescription
+      // mit "Called in wrong state: stable" zum Scheitern bringen und ICE stören.
+      if (_connection!.signalingState ==
+          RTCSignalingState.RTCSignalingStateStable) {
+        logger.d(
+            'Ignoring provisional SDP ($status_code): PeerConnection already stable');
+      } else {
+        try {
+          await _connection!.setRemoteDescription(answer);
+        } catch (error) {
+          logger.e(
+              'emit "peerconnection:setremotedescriptionfailed" [error:${error.toString()}]');
+          emit(EventSetRemoteDescriptionFailed(exception: error));
+        }
       }
     } else if (utils.test2XX(status_code)) {
       // 2XX
