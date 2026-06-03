@@ -2663,12 +2663,25 @@ class RTCSession extends EventManager implements Owner {
       RTCSessionDescription answer =
           RTCSessionDescription(response.body, SdpType.answer.name);
 
-      // Be ready for 200 with SDP after a 180/183 with SDP.
-      // We created a SDP 'answer' for it, so check the current signaling state.
+      // If the PC is already stable (from a 183 with SDP / early media), the session
+      // is already fully negotiated. The 200 OK typically carries the identical SDP.
+      // Calling createOffer+setLocalDescription here would restart ICE and destroy
+      // the already-working audio encoder. Just ACK and confirm.
       if (_connection!.signalingState ==
-              RTCSignalingState.RTCSignalingStateStable ||
-          _connection!.signalingState ==
-              RTCSignalingState.RTCSignalingStateHaveLocalOffer) {
+          RTCSignalingState.RTCSignalingStateStable) {
+        logger.d(
+            '200 OK: PC already stable from early media (183) – skipping re-offer, ACK+CONFIRM only');
+        _handleSessionTimersInIncomingResponse(response);
+        _accepted(Originator.remote, response);
+        OutgoingRequest ack = sendRequest(SipMethod.ACK);
+        _confirmed(Originator.local, ack);
+        return;
+      }
+
+      // Re-INVITE scenario: PC is in have-local-offer (e.g. hold re-INVITE).
+      // Re-create offer so the 200 OK answer can be applied correctly.
+      if (_connection!.signalingState ==
+          RTCSignalingState.RTCSignalingStateHaveLocalOffer) {
         try {
           RTCSessionDescription offer =
               await _connection!.createOffer(_rtcOfferConstraints!);
