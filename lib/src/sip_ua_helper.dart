@@ -74,6 +74,14 @@ class SIPUAHelper extends EventManager {
   void stop() async {
     if (_ua != null) {
       _ua!.stop();
+      // Force-disconnect the socket transport immediately.
+      // ua.stop() normally waits up to 2 s for a REGISTER Expires:0 response
+      // before calling disconnect(). During that window the socket-transport
+      // reconnect timer can fire, reset _close_requested = false and start a
+      // new WS connection that triggers re-registration — a "ghost UA" loop.
+      // Calling disconnect() here sets _close_requested = true immediately and
+      // cancels any pending recovery timer, which stops the reconnect loop.
+      _ua!.socketTransport?.disconnect();
     } else {
       logger.w('ERROR: stop called but not started, call start first.');
     }
@@ -85,6 +93,20 @@ class SIPUAHelper extends EventManager {
   /// die alte TCP-Verbindung lautlos tot — sip_ua erkennt das nicht sofort.
   /// Diese Methode schließt den alten Socket aktiv und öffnet sofort einen neuen,
   /// damit sip_ua [transportStateChanged(CONNECTED)] auf dem neuen Interface feuert.
+  /// Marks the active session for [call] as attempting ICE restart so that a
+  /// failed proactive RE-INVITE (sent before ICE disconnects) does not call
+  /// terminate(). This mirrors what rtc_session.dart sets automatically when
+  /// ICE goes Disconnected, but is needed when the RE-INVITE fires first.
+  void markCallIceRestartInProgress(Call call) {
+    call.session.markIceRestartInProgress();
+  }
+
+  /// Cancels the ICE-Disconnect timer for [call] so a pending RE-INVITE
+  /// is not racing against the 12s termination timer.
+  void cancelCallIceDisconnectTimer(Call call) {
+    call.session.cancelIceDisconnectTimer();
+  }
+
   void reconnectTransport() {
     if (_ua == null) {
       logger.w('reconnectTransport: UA not initialized');
@@ -154,9 +176,10 @@ class SIPUAHelper extends EventManager {
     Map<String, dynamic>? options,
     bool useUpdate = false,
     Function(IncomingMessage?)? done,
+    Function()? onFailed,
   }) async {
     Map<String, dynamic> finalOptions = options ?? buildCallOptions(voiceOnly);
-    call.renegotiate(options: finalOptions, useUpdate: useUpdate, done: done);
+    call.renegotiate(options: finalOptions, useUpdate: useUpdate, done: done, onFailed: onFailed);
   }
 
   Future<void> start(UaSettings uaSettings) async {
@@ -379,6 +402,14 @@ class SIPUAHelper extends EventManager {
       logger.d('Reinvite received in helper, notifying listeners');
       _notifyReInviteListeners(event);
     });
+    handlers.on(EventIceDisconnected(), (EventIceDisconnected event) {
+      logger.d('ICE connection disconnected — notifying listeners for RE-INVITE');
+      _notifyCallStateListeners(event, CallState(CallStateEnum.ICE_DISCONNECT));
+    });
+    handlers.on(EventIceFailed(), (EventIceFailed event) {
+      logger.d('ICE connection failed during restart attempt — notifying listeners for IceRestart:true RE-INVITE');
+      _notifyCallStateListeners(event, CallState(CallStateEnum.ICE_FAILED));
+    });
     handlers.on(EventCallRefer(), (EventCallRefer refer) async {
       logger.d('Refer received, Transfer current call to => ${refer.aor}');
       _notifyCallStateListeners(
@@ -565,6 +596,13 @@ enum CallStateEnum {
   HOLD,
   UNHOLD,
   CALL_INITIATION,
+  /// ICE connection moved to Disconnected (network interface change detected).
+  /// VoipService should send a RE-INVITE immediately while the WS is still up.
+  ICE_DISCONNECT,
+  /// ICE connection moved to Failed while a restart attempt was in progress.
+  /// VoipService should send a RE-INVITE with IceRestart:true — setRemoteDescription
+  /// alone cannot bring ICE out of Failed state.
+  ICE_FAILED,
 }
 
 class Call {
@@ -650,9 +688,10 @@ class Call {
     required Map<String, dynamic>? options,
     bool useUpdate = false,
     Function(IncomingMessage?)? done,
+    Function()? onFailed,
   }) {
     assert(_session != null, 'ERROR(renegotiate): rtc session is invalid!');
-    _session.renegotiate(options: options, useUpdate: useUpdate, done: done);
+    _session.renegotiate(options: options, useUpdate: useUpdate, done: done, onFailed: onFailed);
   }
 
   void sendDTMF(String tones, [Map<String, dynamic>? options]) {

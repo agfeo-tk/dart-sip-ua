@@ -116,3 +116,18 @@ class EventCallRefer extends CallEvent {
   //bool Function([dynamic options]) reject;
   dynamic reject;
 }
+
+/// Fired when the ICE connection transitions to Disconnected state.
+/// VoipService can use this to send a RE-INVITE over the still-alive WS
+/// before the PBX closes the session.
+class EventIceDisconnected extends CallEvent {
+  EventIceDisconnected({RTCSession? session}) : super(session);
+}
+
+/// Fired when the ICE connection transitions to Failed state while an ICE
+/// restart attempt is in progress (_isAttemptingIceRestart = true).
+/// VoipService should send a RE-INVITE with IceRestart:true to force ICE
+/// back to Checking — setRemoteDescription alone cannot leave Failed state.
+class EventIceFailed extends CallEvent {
+  EventIceFailed({RTCSession? session}) : super(session);
+}
