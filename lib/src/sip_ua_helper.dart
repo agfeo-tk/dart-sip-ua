@@ -598,14 +598,23 @@ class Call {
     _session.terminate(options);
   }
 
-  void hold() {
+  /// Puts the session on hold.
+  ///
+  /// [done] fires once the hold re-INVITE succeeded (200 OK applied).
+  /// Returns false if the session is not in a state that allows holding
+  /// (not confirmed, already on hold, or a re-offer is pending).
+  bool hold([Function(IncomingMessage?)? done]) {
     assert(_session != null, 'ERROR(hold): rtc session is invalid!');
-    _session.hold();
+    return _session.hold(null, done);
   }
 
-  void unhold() {
+  /// Resumes a held session.
+  ///
+  /// [done] fires once the unhold re-INVITE succeeded (200 OK applied).
+  /// Returns false if the session is not held or a re-offer is pending.
+  bool unhold([Function(IncomingMessage?)? done]) {
     assert(_session != null, 'ERROR(unhold): rtc session is invalid!');
-    _session.unhold();
+    return _session.unhold(null, done);
   }
 
   void mute([bool audio = true, bool video = true]) {
