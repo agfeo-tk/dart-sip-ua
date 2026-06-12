@@ -558,15 +558,27 @@ class Call {
     _session.answer(options);
   }
 
-  void refer(String target) {
+  /// Sends an in-dialog REFER to transfer this call to [target].
+  ///
+  /// [onAccepted] fires when the peer accepted the REFER (the session is
+  /// terminated right before). [onFailed] fires when the REFER was rejected
+  /// or the resulting NOTIFY reported a failure.
+  void refer(String target, {void Function()? onAccepted, void Function()? onFailed}) {
     assert(_session != null, 'ERROR(refer): rtc session is invalid!');
     ReferSubscriber refer = _session.refer(target)!;
     refer.on(EventReferTrying(), (EventReferTrying data) {});
     refer.on(EventReferProgress(), (EventReferProgress data) {});
     refer.on(EventReferAccepted(), (EventReferAccepted data) {
       _session.terminate();
+      if (onAccepted != null) {
+        onAccepted();
+      }
     });
-    refer.on(EventReferFailed(), (EventReferFailed data) {});
+    refer.on(EventReferFailed(), (EventReferFailed data) {
+      if (onFailed != null) {
+        onFailed();
+      }
+    });
   }
 
   void hangup([Map<String, dynamic>? options]) {
