@@ -560,12 +560,25 @@ class Call {
 
   /// Sends an in-dialog REFER to transfer this call to [target].
   ///
-  /// [onAccepted] fires when the peer accepted the REFER (the session is
-  /// terminated right before). [onFailed] fires when the REFER was rejected
-  /// or the resulting NOTIFY reported a failure.
+  /// [onAccepted] fires when the transfer succeeded – the peer reported a 2xx
+  /// in the refer NOTIFY (the session is terminated right before).
+  /// [onFailed] fires at most once when the transfer failed: either the REFER
+  /// request itself was rejected (4xx/5xx/6xx → [EventReferRequestFailed]) or
+  /// the resulting NOTIFY reported a non-2xx status ([EventReferFailed]).
   void refer(String target, {void Function()? onAccepted, void Function()? onFailed}) {
     assert(_session != null, 'ERROR(refer): rtc session is invalid!');
     ReferSubscriber refer = _session.refer(target)!;
+    bool failureReported = false;
+    void reportFailure() {
+      if (failureReported) {
+        return;
+      }
+      failureReported = true;
+      if (onFailed != null) {
+        onFailed();
+      }
+    }
+
     refer.on(EventReferTrying(), (EventReferTrying data) {});
     refer.on(EventReferProgress(), (EventReferProgress data) {});
     refer.on(EventReferAccepted(), (EventReferAccepted data) {
@@ -574,10 +587,11 @@ class Call {
         onAccepted();
       }
     });
+    refer.on(EventReferRequestFailed(), (EventReferRequestFailed data) {
+      reportFailure();
+    });
     refer.on(EventReferFailed(), (EventReferFailed data) {
-      if (onFailed != null) {
-        onFailed();
-      }
+      reportFailure();
     });
   }
 
