@@ -543,11 +543,11 @@ class IncomingRequest extends IncomingMessage {
 
     reason = reason ?? null;
 
-    // Validate code and reason values.
+    // Validate status code. (reason ist als String? typisiert – ein eigener Reason-Phrase-Check
+    // ist überflüssig und warf zuvor fälschlich für JEDEN nicht-null Reason, z. B. bei
+    // reply(481, 'Subscription does not exist').)
     if (code < 100 || code > 699) {
       throw Exceptions.TypeError('Invalid status_code: $code');
-    } else if (reason != null) {
-      throw Exceptions.TypeError('Invalid reason_phrase: $reason');
     }
 
     reason = reason ?? DartSIP_C.REASON_PHRASE[code] ?? '';
