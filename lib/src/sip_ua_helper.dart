@@ -377,7 +377,12 @@ class SIPUAHelper extends EventManager {
         'tcpCandidatePolicy':
             (_uaSettings?.tcpCandidatePolicy ?? TcpCandidatePolicy.ENABLED)
                 .toParameterString(),
-        'iceCandidatePoolSize': _uaSettings?.iceCandidatePoolSize
+        'iceCandidatePoolSize': _uaSettings?.iceCandidatePoolSize,
+        // Nahtlose Netzwechsel: nach Interface-Wechsel neue Kandidaten sammeln
+        // und renominieren (siehe UaSettings.iceGatherContinually).
+        'continualGatheringPolicy': _uaSettings?.iceGatherContinually == true
+            ? 'gather_continually'
+            : 'gather_once',
       },
       'mediaConstraints': <String, dynamic>{
         'audio': true,
@@ -945,6 +950,12 @@ class UaSettings {
 
   /// ICE Gathering Timeout, default 500ms
   int iceGatheringTimeout = 500;
+
+  /// Kandidaten kontinuierlich sammeln (continualGatheringPolicy: gather_continually).
+  /// Nötig für nahtlose Netzwechsel (5G↔WLAN) im laufenden Gespräch: libwebrtc sammelt
+  /// dann auch nach dem Verbindungsaufbau Kandidaten auf neu erscheinenden Interfaces
+  /// und nominiert gegen ice-lite-Gegenstellen von der neuen Adresse neu. Default false.
+  bool iceGatherContinually = false;
 
   /// Max interval between recovery connection, default 30 sec
   int connectionRecoveryMaxInterval = 30;
