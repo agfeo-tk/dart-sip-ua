@@ -1567,7 +1567,7 @@ class RTCSession extends EventManager implements Owner {
     clearTimeout(_timers.invite2xxTimer);
     clearTimeout(_timers.userNoAnswerTimer);
 
-    _iceDisconnectTimer?.cancel();
+    _cancelIceDisconnectTimer();
 
     // Clear Session Timers.
     clearTimeout(_sessionTimers.timer);
@@ -1652,6 +1652,18 @@ class RTCSession extends EventManager implements Owner {
     renegotiate(options: offerConstraints);
   }
 
+  /// Bricht den ICE-Disconnect-Timer ab UND gibt die Referenz frei.
+  ///
+  /// Das Nullen ist wesentlich, nicht kosmetisch: bewaffnet wird der Timer nur unter der
+  /// Bedingung `_iceDisconnectTimer == null`. Blieb die Referenz eines bereits abgebrochenen
+  /// Timers stehen, wurde pro Session nur beim ERSTEN ICE-Disconnect ein Restart-Versuch
+  /// bewaffnet; jeder weitere Disconnect landete stumm im Zweig
+  /// "ICE disconnect timer not started (already running or attempting restart)".
+  void _cancelIceDisconnectTimer() {
+    _iceDisconnectTimer?.cancel();
+    _iceDisconnectTimer = null;
+  }
+
   Future<void> _createRTCConnection(Map<String, dynamic> pcConfig,
       Map<String, dynamic> rtcConstraints) async {
     _connection = await createPeerConnection(pcConfig, rtcConstraints);
@@ -1660,13 +1672,13 @@ class RTCSession extends EventManager implements Owner {
           _state == RtcSessionState.canceled) {
         logger.d(
             'ICE State change ignored, SIP session already terminated/canceled.');
-        _iceDisconnectTimer?.cancel();
+        _cancelIceDisconnectTimer();
         return;
       }
 
       if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
         logger.e('ICE Connection State Failed.');
-        _iceDisconnectTimer?.cancel();
+        _cancelIceDisconnectTimer();
         terminate(<String, dynamic>{
           'cause': DartSIP_C.CausesType.RTP_TIMEOUT,
           'status_code': 408,
@@ -1703,7 +1715,7 @@ class RTCSession extends EventManager implements Owner {
         if (_iceDisconnectTimer != null || _isAttemptingIceRestart) {
           logger.i(
               'ICE Connection State Connected/Completed. Canceling timer/resetting flag.');
-          _iceDisconnectTimer?.cancel();
+          _cancelIceDisconnectTimer();
           _isAttemptingIceRestart = false;
         } else {
           logger.i('ICE Connection State Connected/Completed.');
@@ -1711,7 +1723,7 @@ class RTCSession extends EventManager implements Owner {
       } else if (state == RTCIceConnectionState.RTCIceConnectionStateClosed) {
         // Connection closed locally, usually via _connection.close() called by terminate()
         logger.i('ICE Connection State Closed.'); // Use logger.i
-        _iceDisconnectTimer?.cancel(); // Ensure timer is cancelled
+        _cancelIceDisconnectTimer(); // Ensure timer is cancelled
         // Ensure *SIP* session state reflects closure if not already set by terminate()
         if (_state != RtcSessionState.terminated &&
             _state != RtcSessionState.canceled) {
