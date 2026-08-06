@@ -122,6 +122,9 @@ class RTCSession extends EventManager implements Owner {
 
   Timer? _iceDisconnectTimer;
   bool _isAttemptingIceRestart = false;
+  // AGFEO: laeuft, waehrend nach RTCIceConnectionStateFailed auf eine Erholung gewartet wird
+  // (siehe UaSettings.iceFailedGraceTimeout).
+  Timer? _iceFailedGraceTimer;
 
   // SIP Timers.
   final SIPTimers _timers = SIPTimers();
@@ -1568,6 +1571,7 @@ class RTCSession extends EventManager implements Owner {
     clearTimeout(_timers.userNoAnswerTimer);
 
     _cancelIceDisconnectTimer();
+    _cancelIceFailedGraceTimer();
 
     // Clear Session Timers.
     clearTimeout(_sessionTimers.timer);
@@ -1652,6 +1656,26 @@ class RTCSession extends EventManager implements Owner {
     renegotiate(options: offerConstraints);
   }
 
+  /// Beendet die Session wegen endgueltig gescheitertem ICE.
+  void _terminateOnIceFailure()
+  {
+    terminate(<String, dynamic>{
+      'cause': DartSIP_C.CausesType.RTP_TIMEOUT,
+      'status_code': 408,
+      'reason_phrase': 'ICE Connection Failed'
+    });
+  }
+
+  /// Bricht die ICE-Failed-Karenzzeit ab und gibt die Referenz frei.
+  ///
+  /// Wie bei _cancelIceDisconnectTimer ist das Nullen wesentlich: der Failed-Zweig bewaffnet
+  /// den Timer nur, wenn die Referenz frei ist.
+  void _cancelIceFailedGraceTimer()
+  {
+    _iceFailedGraceTimer?.cancel();
+    _iceFailedGraceTimer = null;
+  }
+
   /// Bricht den ICE-Disconnect-Timer ab UND gibt die Referenz frei.
   ///
   /// Das Nullen ist wesentlich, nicht kosmetisch: bewaffnet wird der Timer nur unter der
@@ -1673,17 +1697,37 @@ class RTCSession extends EventManager implements Owner {
         logger.d(
             'ICE State change ignored, SIP session already terminated/canceled.');
         _cancelIceDisconnectTimer();
+        _cancelIceFailedGraceTimer();
         return;
       }
 
       if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
         logger.e('ICE Connection State Failed.');
         _cancelIceDisconnectTimer();
-        terminate(<String, dynamic>{
-          'cause': DartSIP_C.CausesType.RTP_TIMEOUT,
-          'status_code': 408,
-          'reason_phrase': 'ICE Connection Failed'
-        });
+        final int graceMs = _ua.configuration.ice_failed_grace_timeout;
+        if (graceMs <= 0) {
+          _terminateOnIceFailure();
+        } else if (_iceFailedGraceTimer == null) {
+          // AGFEO: "failed" ist bei libwebrtc nicht endgueltig - mit continual gathering
+          // werden weiter Kandidaten gesammelt und Pruefungen gesendet, ein Pfad kann von
+          // allein zurueckkommen. Daher erst nach Karenzzeit beenden, und nur wenn ICE bis
+          // dahin nicht erholt ist (Connected/Completed bricht den Timer ab).
+          logger.w('ICE failed - waiting up to ${graceMs}ms for recovery before terminating');
+          _iceFailedGraceTimer = Timer(Duration(milliseconds: graceMs), () {
+            _iceFailedGraceTimer = null;
+            final RTCIceConnectionState? now = _connection?.iceConnectionState;
+            if (_state == RtcSessionState.terminated || _state == RtcSessionState.canceled) {
+              return;
+            }
+            if (now == RTCIceConnectionState.RTCIceConnectionStateConnected ||
+                now == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
+              logger.i('ICE recovered during grace period ($now), call continues');
+              return;
+            }
+            logger.e('ICE still not usable after grace period ($now), terminating');
+            _terminateOnIceFailure();
+          });
+        }
       } else if (state ==
           RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
         logger.w('ICE Connection State Disconnected.');
@@ -1711,6 +1755,14 @@ class RTCSession extends EventManager implements Owner {
       } else if (state ==
               RTCIceConnectionState.RTCIceConnectionStateConnected ||
           state == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
+        // AGFEO: Erholung nach "failed" - unbedingt abbrechen, NICHT in der Bedingung unten
+        // mitpruefen. Laeuft nur die Karenzzeit (ohne Disconnect-Timer, ohne Restart-Flag),
+        // wuerde der Zweig unten uebersprungen und der Timer das Gespraech beenden, obwohl
+        // ICE wieder steht.
+        if (_iceFailedGraceTimer != null) {
+          logger.i('ICE recovered after failure ($state), canceling grace timer');
+          _cancelIceFailedGraceTimer();
+        }
         // If connection recovers, cancel timer and reset flag
         if (_iceDisconnectTimer != null || _isAttemptingIceRestart) {
           logger.i(
@@ -1724,6 +1776,7 @@ class RTCSession extends EventManager implements Owner {
         // Connection closed locally, usually via _connection.close() called by terminate()
         logger.i('ICE Connection State Closed.'); // Use logger.i
         _cancelIceDisconnectTimer(); // Ensure timer is cancelled
+        _cancelIceFailedGraceTimer();
         // Ensure *SIP* session state reflects closure if not already set by terminate()
         if (_state != RtcSessionState.terminated &&
             _state != RtcSessionState.canceled) {

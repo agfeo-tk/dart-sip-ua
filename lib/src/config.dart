@@ -64,6 +64,11 @@ class Settings {
   /// ICE Gathering Timeout (in millisecond).
   int ice_gathering_timeout = 500;
 
+  /// Karenzzeit in Millisekunden, die bei RTCIceConnectionStateFailed auf eine Erholung
+  /// gewartet wird, bevor das Gespraech beendet wird. 0 = sofort beenden (bisheriges
+  /// Verhalten). Erholt sich ICE innerhalb der Zeit, laeuft das Gespraech weiter.
+  int ice_failed_grace_timeout = 0;
+
   /// Call statistics in the log
   bool log_call_statistics = false;
 
@@ -258,6 +263,11 @@ class Checks {
     },
     'ice_gathering_timeout': (Settings src, Settings? dst) {
       dst!.ice_gathering_timeout = src.ice_gathering_timeout;
+    },
+    'ice_failed_grace_timeout': (Settings src, Settings? dst) {
+      if (src.ice_failed_grace_timeout >= 0) {
+        dst!.ice_failed_grace_timeout = src.ice_failed_grace_timeout;
+      }
     },
     'log_call_statistics': (Settings src, Settings? dst) {
       dst!.log_call_statistics = src.log_call_statistics;

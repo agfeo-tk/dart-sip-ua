@@ -181,6 +181,7 @@ class SIPUAHelper extends EventManager {
     _settings.dtmf_mode = uaSettings.dtmfMode;
     _settings.session_timers = uaSettings.sessionTimers;
     _settings.ice_gathering_timeout = uaSettings.iceGatheringTimeout;
+    _settings.ice_failed_grace_timeout = uaSettings.iceFailedGraceTimeout;
     _settings.session_timers_refresh_method =
         uaSettings.sessionTimersRefreshMethodEnum;
     _settings.instance_id = uaSettings.instanceId;
@@ -950,6 +951,17 @@ class UaSettings {
 
   /// ICE Gathering Timeout, default 500ms
   int iceGatheringTimeout = 500;
+
+  /// Karenzzeit in Millisekunden, die bei `RTCIceConnectionStateFailed` auf eine Erholung
+  /// gewartet wird, bevor das Gespräch beendet wird. 0 = sofort beenden (Default, bisheriges
+  /// Verhalten).
+  ///
+  /// libwebrtc meldet `failed`, wenn alle Kandidatenpaare gescheitert sind – der Zustand ist
+  /// aber nicht endgültig: mit `iceGatherContinually` werden weiter Kandidaten gesammelt und
+  /// Prüfungen gesendet, ein Pfad kann also von allein zurückkommen. Im Feldtest am
+  /// 06.08.2026 wurde ein Gespräch 10,5 s nach `disconnected` beendet, während der neue
+  /// WLAN-Pfad 7 s später tragfähig geworden wäre – reines Abwarten hätte gereicht.
+  int iceFailedGraceTimeout = 0;
 
   /// Kandidaten kontinuierlich sammeln (continualGatheringPolicy: gather_continually).
   /// Nötig für nahtlose Netzwechsel (5G↔WLAN) im laufenden Gespräch: libwebrtc sammelt
