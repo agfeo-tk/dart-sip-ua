@@ -171,14 +171,6 @@ class Registrator {
           return;
         }
 
-        // Eine vorlaeufige Antwort belegt nur, dass die Anfrage angekommen ist –
-        // die Frist laeuft weiter, bis die endgueltige Antwort da ist.
-        if (utils.test1XX(event.response!.status_code.toString())) {
-          _startResponseWatch();
-        } else {
-          _cancelResponseWatch();
-        }
-
         // Clear registration timer.
         if (_registrationTimer != null) {
           clearTimeout(_registrationTimer);
@@ -191,6 +183,11 @@ class Registrator {
           // Ignore provisional responses.
         } else if (utils.test2XX(status_code)) {
           _registering = false;
+          // Nur eine bestaetigte Registrierung beendet die Antwortfrist. Die
+          // Fehlerzweige raeumen sie ueber _registrationFailure() selbst ab; nach
+          // einem 423 bleibt sie bewusst bewaffnet, damit ein verschluckter
+          // Wiederholungsversuch nicht unbemerkt bleibt.
+          _cancelResponseWatch();
 
           if (!event.response!.hasHeader('Contact')) {
             logger.d(
