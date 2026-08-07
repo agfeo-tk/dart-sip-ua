@@ -218,6 +218,7 @@ class SIPUAHelper extends EventManager {
     _settings.ice_gathering_timeout = uaSettings.iceGatheringTimeout;
     _settings.ice_failed_grace_timeout = uaSettings.iceFailedGraceTimeout;
     _settings.register_response_timeout = uaSettings.registerResponseTimeout;
+    _settings.ice_restart_on_failure = uaSettings.iceRestartOnFailure;
     _settings.session_timers_refresh_method =
         uaSettings.sessionTimersRefreshMethodEnum;
     _settings.instance_id = uaSettings.instanceId;
@@ -1012,6 +1013,13 @@ class UaSettings {
   /// Läuft die Frist ab, wird `registrationFailed` gemeldet, damit die Anwendung den
   /// Transport neu aufbauen kann. Default 0 = aus.
   int registerResponseTimeout = 0;
+
+  /// Ob nach `RTCIceConnectionStateFailed` ein ICE-Restart per Re-INVITE versucht wird.
+  /// Greift auf halber [iceFailedGraceTimeout] und nur einmal je Störung: hat libwebrtc
+  /// die Kandidatenpaare verworfen, kann Abwarten allein nichts mehr retten, ein zu
+  /// früher Restart würde dagegen eine Prüfliste abräumen, die kurz vor dem Erfolg steht.
+  /// Ein gescheitertes Re-INVITE beendet das Gespräch nicht. Default false.
+  bool iceRestartOnFailure = false;
 
   /// Max interval between recovery connection, default 30 sec
   int connectionRecoveryMaxInterval = 30;

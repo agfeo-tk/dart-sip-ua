@@ -125,6 +125,11 @@ class RTCSession extends EventManager implements Owner {
   // AGFEO: laeuft, waehrend nach RTCIceConnectionStateFailed auf eine Erholung gewartet wird
   // (siehe UaSettings.iceFailedGraceTimeout).
   Timer? _iceFailedGraceTimer;
+  // AGFEO: laeuft auf halber Karenzzeit und setzt dann den ICE-Restart ab
+  // (siehe UaSettings.iceRestartOnFailure).
+  Timer? _iceRestartTimer;
+  // AGFEO: ein Restart je Stoerung; Ruecksetzung, sobald ICE wieder traegt.
+  bool _iceRestartAttempted = false;
 
   // SIP Timers.
   final SIPTimers _timers = SIPTimers();
@@ -1163,9 +1168,14 @@ class RTCSession extends EventManager implements Owner {
     return true;
   }
 
+  /// @param terminateOnFailure Ob ein gescheitertes Re-INVITE das Gespraech beendet.
+  ///        Standard true (bisheriges Verhalten). Der ICE-Restart setzt false: dort
+  ///        laeuft ohnehin die Karenzzeit, und ein gescheiterter Rettungsversuch darf
+  ///        das Gespraech nicht frueher beenden als Abwarten es getan haette.
   bool renegotiate(
       {Map<String, dynamic>? options,
       bool useUpdate = false,
+      bool terminateOnFailure = true,
       Function(IncomingMessage?)? done}) {
     logger.d('renegotiate()');
 
@@ -1206,6 +1216,10 @@ class RTCSession extends EventManager implements Owner {
     });
 
     handlers.on(EventCallFailed(), (EventCallFailed event) {
+      if (!terminateOnFailure) {
+        logger.w('media renegotiation failed, call continues');
+        return;
+      }
       terminate(<String, dynamic>{
         'cause': DartSIP_C.CausesType.WEBRTC_ERROR,
         'status_code': 500,
@@ -1572,6 +1586,7 @@ class RTCSession extends EventManager implements Owner {
 
     _cancelIceDisconnectTimer();
     _cancelIceFailedGraceTimer();
+    _cancelIceRestartTimer();
 
     // Clear Session Timers.
     clearTimeout(_sessionTimers.timer);
@@ -1646,14 +1661,49 @@ class RTCSession extends EventManager implements Owner {
     }, Timers.TIMER_H);
   }
 
-  void _iceRestart() async {
-    Map<String, dynamic> offerConstraints = _rtcOfferConstraints ??
-        <String, dynamic>{
-          'mandatory': <String, dynamic>{},
-          'optional': <dynamic>[],
-        };
-    offerConstraints['mandatory']['IceRestart'] = true;
-    renegotiate(options: offerConstraints);
+  /// Verhandelt ICE per Re-INVITE neu (neues ufrag/pwd, frische Kandidatenpruefung).
+  ///
+  /// Nur sinnvoll, wenn libwebrtc die alten Kandidatenpaare abgeraeumt hat: nach
+  /// "failed" liefert getStats keine Paare mehr, abwarten kann dann nichts mehr
+  /// retten. Scheitert das Re-INVITE, wird das Gespraech ausdruecklich NICHT
+  /// beendet – es laeuft ohnehin die Karenzzeit, und ein Restart darf nicht
+  /// weniger nachsichtig sein als reines Abwarten.
+  ///
+  /// @return true, wenn ein Re-INVITE abgesetzt wurde.
+  bool _iceRestart() {
+    if (!_ua.isConnected()) {
+      // Ohne stehenden Transport kaeme das Re-INVITE nicht raus und liefe erst nach
+      // Timer B (32 s) auf, weit hinter der Karenzzeit. Nach einem Netzwechsel baut
+      // die Anwendung den Transport neu auf; der naechste Versuch trifft ihn dann.
+      logger.w('ICE restart skipped, transport is not connected');
+      return false;
+    }
+
+    // _rtcOfferConstraints nicht veraendern: die Map wird fuer jedes weitere Angebot
+    // wiederverwendet, "IceRestart" wuerde sonst haften und jedes kuenftige Halten
+    // oder Zurueckholen ICE mit neu verhandeln lassen. Die offerModifiers (Codec-Filter,
+    // Opus-/RED-Anpassung) muessen dagegen erhalten bleiben, sonst geht das Angebot mit
+    // unpassendem SDP raus.
+    final Map<String, dynamic> constraints = <String, dynamic>{
+      ...?_rtcOfferConstraints,
+    };
+    final Map<String, dynamic> mandatory = <String, dynamic>{
+      ...?(constraints['mandatory'] as Map<String, dynamic>?),
+    };
+    mandatory['IceRestart'] = true;
+    constraints['mandatory'] = mandatory;
+    constraints['optional'] ??= <dynamic>[];
+
+    logger.w('Attempting ICE restart via re-INVITE');
+    return renegotiate(
+        options: <String, dynamic>{'rtcOfferConstraints': constraints},
+        terminateOnFailure: false);
+  }
+
+  /// Bricht den geplanten ICE-Restart ab und gibt die Referenz frei.
+  void _cancelIceRestartTimer() {
+    _iceRestartTimer?.cancel();
+    _iceRestartTimer = null;
   }
 
   /// Beendet die Session wegen endgueltig gescheitertem ICE.
@@ -1698,6 +1748,7 @@ class RTCSession extends EventManager implements Owner {
             'ICE State change ignored, SIP session already terminated/canceled.');
         _cancelIceDisconnectTimer();
         _cancelIceFailedGraceTimer();
+        _cancelIceRestartTimer();
         return;
       }
 
@@ -1713,6 +1764,31 @@ class RTCSession extends EventManager implements Owner {
           // allein zurueckkommen. Daher erst nach Karenzzeit beenden, und nur wenn ICE bis
           // dahin nicht erholt ist (Connected/Completed bricht den Timer ab).
           logger.w('ICE failed - waiting up to ${graceMs}ms for recovery before terminating');
+          // AGFEO: Auf halber Karenzzeit einen ICE-Restart versuchen, nicht sofort.
+          // Nach "failed" kann ein Pfad noch von allein zurueckkommen (am 06.08.2026
+          // 7 s spaeter gemessen), und ein Restart raeumt genau die Pruefliste ab, die
+          // kurz davor waere. Erst wenn diese Frist ohne Erholung verstreicht, ist der
+          // Restart die einzige Chance - libwebrtc hat die Paare dann verworfen, und
+          // die zweite Haelfte der Karenzzeit bleibt, damit er greifen kann.
+          if (_ua.configuration.ice_restart_on_failure &&
+              !_iceRestartAttempted &&
+              _iceRestartTimer == null) {
+            _iceRestartTimer = Timer(Duration(milliseconds: graceMs ~/ 2), () {
+              _iceRestartTimer = null;
+              final RTCIceConnectionState? now = _connection?.iceConnectionState;
+              if (_state == RtcSessionState.terminated ||
+                  _state == RtcSessionState.canceled ||
+                  now == RTCIceConnectionState.RTCIceConnectionStateConnected ||
+                  now == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
+                return;
+              }
+              // Nur ein Versuch je Stoerung: erholt sich ICE, wird das Flag zurueckgesetzt.
+              // Sonst wuerde jedes weitere "failed" ein Re-INVITE nachschieben, waehrend
+              // gar kein Netz traegt.
+              _iceRestartAttempted = true;
+              _iceRestart();
+            });
+          }
           _iceFailedGraceTimer = Timer(Duration(milliseconds: graceMs), () {
             _iceFailedGraceTimer = null;
             final RTCIceConnectionState? now = _connection?.iceConnectionState;
@@ -1740,9 +1816,15 @@ class RTCSession extends EventManager implements Owner {
                 _state != RtcSessionState.terminated &&
                 _state != RtcSessionState.canceled &&
                 !_isAttemptingIceRestart) {
-              logger.i('Attempting ICE restart after timeout...');
-              _isAttemptingIceRestart = true;
-              _iceRestart();
+              // AGFEO: hinter dem Flag, damit das Aus-Verhalten unveraendert bleibt. Der
+              // Zweig war bis zur Reparatur von _iceRestart() ohnehin nie wirksam.
+              if (!_ua.configuration.ice_restart_on_failure) {
+                logger.i('ICE restart after disconnect timeout disabled by configuration.');
+              } else {
+                logger.i('Attempting ICE restart after timeout...');
+                _isAttemptingIceRestart = true;
+                _iceRestart();
+              }
             } else {
               logger.i('ICE restart aborted (state changed during timer).');
             }
@@ -1763,6 +1845,9 @@ class RTCSession extends EventManager implements Owner {
           logger.i('ICE recovered after failure ($state), canceling grace timer');
           _cancelIceFailedGraceTimer();
         }
+        // Geplanten Restart fallen lassen und fuer eine spaetere Stoerung wieder freigeben.
+        _cancelIceRestartTimer();
+        _iceRestartAttempted = false;
         // If connection recovers, cancel timer and reset flag
         if (_iceDisconnectTimer != null || _isAttemptingIceRestart) {
           logger.i(
@@ -1777,6 +1862,7 @@ class RTCSession extends EventManager implements Owner {
         logger.i('ICE Connection State Closed.'); // Use logger.i
         _cancelIceDisconnectTimer(); // Ensure timer is cancelled
         _cancelIceFailedGraceTimer();
+        _cancelIceRestartTimer();
         // Ensure *SIP* session state reflects closure if not already set by terminate()
         if (_state != RtcSessionState.terminated &&
             _state != RtcSessionState.canceled) {

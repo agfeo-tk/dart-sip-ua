@@ -75,6 +75,11 @@ class Settings {
   /// Verhalten).
   int register_response_timeout = 0;
 
+  /// Ob nach RTCIceConnectionStateFailed ein ICE-Restart per Re-INVITE versucht wird,
+  /// bevor die Karenzzeit ablaeuft. Braucht ice_failed_grace_timeout > 0. Default false
+  /// (nur abwarten, bisheriges Verhalten).
+  bool ice_restart_on_failure = false;
+
   /// Call statistics in the log
   bool log_call_statistics = false;
 
@@ -279,6 +284,9 @@ class Checks {
       if (src.register_response_timeout >= 0) {
         dst!.register_response_timeout = src.register_response_timeout;
       }
+    },
+    'ice_restart_on_failure': (Settings src, Settings? dst) {
+      dst!.ice_restart_on_failure = src.ice_restart_on_failure;
     },
     'log_call_statistics': (Settings src, Settings? dst) {
       dst!.log_call_statistics = src.log_call_statistics;
