@@ -217,6 +217,7 @@ class SIPUAHelper extends EventManager {
     _settings.session_timers = uaSettings.sessionTimers;
     _settings.ice_gathering_timeout = uaSettings.iceGatheringTimeout;
     _settings.ice_failed_grace_timeout = uaSettings.iceFailedGraceTimeout;
+    _settings.register_response_timeout = uaSettings.registerResponseTimeout;
     _settings.session_timers_refresh_method =
         uaSettings.sessionTimersRefreshMethodEnum;
     _settings.instance_id = uaSettings.instanceId;
@@ -1003,6 +1004,14 @@ class UaSettings {
   /// dann auch nach dem Verbindungsaufbau Kandidaten auf neu erscheinenden Interfaces
   /// und nominiert gegen ice-lite-Gegenstellen von der neuen Adresse neu. Default false.
   bool iceGatherContinually = false;
+
+  /// Frist in Millisekunden für die endgültige Antwort auf einen gesendeten REGISTER.
+  /// Ein `send()` auf eine WSS-Verbindung, deren Gegenstelle weggefallen ist, gelingt
+  /// lokal – TCP puffert. Im Feldtest am 07.08.2026 fiel der Fehler erst nach 25 s auf,
+  /// da hatte die Anlage den Contact längst verworfen und das Gespräch abgebaut.
+  /// Läuft die Frist ab, wird `registrationFailed` gemeldet, damit die Anwendung den
+  /// Transport neu aufbauen kann. Default 0 = aus.
+  int registerResponseTimeout = 0;
 
   /// Max interval between recovery connection, default 30 sec
   int connectionRecoveryMaxInterval = 30;

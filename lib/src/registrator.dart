@@ -78,6 +78,7 @@ class Registrator {
   late int _cseq;
   URI? _to_uri;
   Timer? _registrationTimer;
+  Timer? _responseTimer;
   late bool _registering;
   bool _registered = false;
   late String _contact;
@@ -147,23 +148,35 @@ class Registrator {
 
     EventManager handlers = EventManager();
     handlers.on(EventOnRequestTimeout(), (EventOnRequestTimeout value) {
+      _cancelResponseWatch();
       _registrationFailure(
           UnHandledResponse(408, DartSIP_C.CausesType.REQUEST_TIMEOUT),
           DartSIP_C.CausesType.REQUEST_TIMEOUT);
     });
     handlers.on(EventOnTransportError(), (EventOnTransportError value) {
+      _cancelResponseWatch();
       _registrationFailure(
           UnHandledResponse(500, DartSIP_C.CausesType.CONNECTION_ERROR),
           DartSIP_C.CausesType.CONNECTION_ERROR);
     });
     handlers.on(EventOnAuthenticated(), (EventOnAuthenticated value) {
       _cseq += 1;
+      // Die Anfrage geht mit Credentials erneut raus – Antwortfrist neu starten.
+      _startResponseWatch();
     });
     handlers.on(EventOnReceiveResponse(), (EventOnReceiveResponse event) {
       {
         // Discard responses to older REGISTER/un-REGISTER requests.
         if (event.response!.cseq != _cseq) {
           return;
+        }
+
+        // Eine vorlaeufige Antwort belegt nur, dass die Anfrage angekommen ist –
+        // die Frist laeuft weiter, bis die endgueltige Antwort da ist.
+        if (utils.test1XX(event.response!.status_code.toString())) {
+          _startResponseWatch();
+        } else {
+          _cancelResponseWatch();
         }
 
         // Clear registration timer.
@@ -213,7 +226,6 @@ class Registrator {
           }
 
           // Re-Register or emit an event before the expiration interval has elapsed.
-          // For that, decrease the expires value. ie: 3 seconds.
           _registrationTimer = setTimeout(() {
             clearTimeout(_registrationTimer);
             _registrationTimer = null;
@@ -224,7 +236,7 @@ class Registrator {
             } else {
               _ua.emit(EventRegistrationExpiring());
             }
-          }, (expires * 1000) - 5000);
+          }, _refreshDelayMs(expires));
 
           // Save gruu values.
           if (contact.hasParam('temp-gruu')) {
@@ -271,6 +283,7 @@ class Registrator {
     RequestSender request_sender = RequestSender(_ua, request, handlers);
 
     _registering = true;
+    _startResponseWatch();
     request_sender.send();
   }
 
@@ -282,6 +295,8 @@ class Registrator {
     }
 
     _registered = false;
+
+    _cancelResponseWatch();
 
     // Clear the registration timer.
     if (_registrationTimer != null) {
@@ -354,6 +369,7 @@ class Registrator {
 
   void onTransportClosed() {
     _registering = false;
+    _cancelResponseWatch();
     if (_registrationTimer != null) {
       clearTimeout(_registrationTimer);
       _registrationTimer = null;
@@ -365,7 +381,63 @@ class Registrator {
     }
   }
 
+  /// Liefert die Wartezeit bis zum naechsten Refresh-REGISTER.
+  ///
+  /// Frueher ging der Refresh pauschal 5 s vor Ablauf raus. Der Abstand war damit
+  /// unabhaengig von der Registrierungsdauer, und ein einziges verlorenes Paket
+  /// kostete die Registrierung: im Feldtest am 07.08.2026 ging der Refresh um
+  /// 15:24:34 in ein sterbendes WLAN, die Anlage entfernte den Contact um
+  /// 15:24:39 und baute das laufende Gespraech ab. Die Haelfte des Intervalls
+  /// laesst Raum fuer Wiederholungen, bevor die Gegenstelle den Contact verwirft.
+  ///
+  /// @param expires Von der Gegenstelle bestaetigte Gueltigkeit in Sekunden.
+  /// @return Wartezeit in Millisekunden, in jedem Fall vor Ablauf liegend.
+  int _refreshDelayMs(num expires) {
+    final int expiresMs = (expires * 1000).round();
+    final int halfMs = expiresMs ~/ 2;
+    final int latestMs = expiresMs - 5000;
+    if (latestMs <= 0) {
+      return halfMs;
+    }
+    return halfMs < latestMs ? halfMs : latestMs;
+  }
+
+  /// Startet die Ueberwachung der Antwort auf einen laufenden REGISTER.
+  ///
+  /// Ein `send()` auf eine WSS-Verbindung, deren Gegenstelle nicht mehr
+  /// erreichbar ist, gelingt lokal – TCP puffert. Der Fehler faellt erst auf,
+  /// wenn der Stack aufgibt (im Feldtest 25 s), und Timer F greift noch spaeter.
+  /// Bleibt die endgueltige Antwort aus, melden wir den Fehlschlag deshalb
+  /// selbst, damit die Anwendung den Transport zeitnah neu aufbauen kann.
+  /// Bei `register_response_timeout` <= 0 bleibt das alte Verhalten.
+  void _startResponseWatch() {
+    _cancelResponseWatch();
+    final int timeout = _ua.configuration.register_response_timeout;
+    if (timeout <= 0) {
+      return;
+    }
+    _responseTimer = setTimeout(() {
+      _responseTimer = null;
+      if (!_registering) {
+        return;
+      }
+      logger.w('no response to REGISTER within ${timeout}ms, assuming failure');
+      _registrationFailure(
+          UnHandledResponse(408, DartSIP_C.CausesType.REQUEST_TIMEOUT),
+          DartSIP_C.CausesType.REQUEST_TIMEOUT);
+    }, timeout);
+  }
+
+  /// Beendet die Antwortueberwachung eines REGISTER.
+  void _cancelResponseWatch() {
+    if (_responseTimer != null) {
+      clearTimeout(_responseTimer);
+      _responseTimer = null;
+    }
+  }
+
   void _registrationFailure(dynamic response, String cause) {
+    _cancelResponseWatch();
     _registering = false;
     _ua.registrationFailed(response: response, cause: cause);
 
@@ -376,6 +448,7 @@ class Registrator {
   }
 
   void _unregistered([dynamic response, String? cause]) {
+    _cancelResponseWatch();
     _registering = false;
     _registered = false;
     _ua.unregistered(response: response, cause: cause);

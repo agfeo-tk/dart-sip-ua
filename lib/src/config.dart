@@ -69,6 +69,12 @@ class Settings {
   /// Verhalten). Erholt sich ICE innerhalb der Zeit, laeuft das Gespraech weiter.
   int ice_failed_grace_timeout = 0;
 
+  /// Frist in Millisekunden, innerhalb der ein gesendeter REGISTER eine endgueltige
+  /// Antwort bekommen muss. Laeuft sie ab, wird der Versuch als fehlgeschlagen
+  /// gemeldet, ohne auf den TCP-Stack oder Timer F zu warten. 0 = aus (bisheriges
+  /// Verhalten).
+  int register_response_timeout = 0;
+
   /// Call statistics in the log
   bool log_call_statistics = false;
 
@@ -267,6 +273,11 @@ class Checks {
     'ice_failed_grace_timeout': (Settings src, Settings? dst) {
       if (src.ice_failed_grace_timeout >= 0) {
         dst!.ice_failed_grace_timeout = src.ice_failed_grace_timeout;
+      }
+    },
+    'register_response_timeout': (Settings src, Settings? dst) {
+      if (src.register_response_timeout >= 0) {
+        dst!.register_response_timeout = src.register_response_timeout;
       }
     },
     'log_call_statistics': (Settings src, Settings? dst) {
