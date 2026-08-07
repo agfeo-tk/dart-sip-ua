@@ -18,6 +18,7 @@ import 'options.dart';
 import 'rtc_session.dart';
 import 'rtc_session/refer_subscriber.dart';
 import 'sip_message.dart';
+import 'socket_transport.dart';
 import 'stack_trace_nj.dart';
 import 'subscriber.dart';
 import 'transport_type.dart';
@@ -76,6 +77,40 @@ class SIPUAHelper extends EventManager {
     } else {
       logger.w('ERROR: stop called but not started, call start first.');
     }
+  }
+
+  /// Erzwingt einen Neuaufbau der Socket-Verbindung, ohne die UA oder laufende Dialoge
+  /// abzureißen.
+  ///
+  /// Nötig nach einem Interface-Wechsel des Geräts (WLAN↔Mobilfunk): die alte TCP-Verbindung
+  /// bleibt lautlos tot, das Betriebssystem meldet das nicht, und sip_ua merkt es erst über
+  /// Timeouts. Die Registrierung läuft dann ab, während das Gespräch noch läuft – die
+  /// Gegenstelle beendet es daraufhin. Im Feldtest am 07.08.2026 hat die Anlage 5 s nach dem
+  /// Ablauf der Registrierung ein BYE geschickt, obwohl die Medien nach dem ICE-Relatch
+  /// einwandfrei über das neue Interface liefen.
+  ///
+  /// Nach dem Verbindungsaufbau registriert [UA.onTransportConnect] automatisch neu, womit die
+  /// Bindung nach RFC 5626 auf den neuen Flow umgestellt wird. Die [SocketTransport]-Instanz
+  /// bleibt dieselbe, laufende Dialoge nutzen also weiter denselben Transport.
+  ///
+  /// Achtung: [UA.onTransportDisconnect] bricht alle offenen Transaktionen ab. Hat eine
+  /// laufende Session gerade einen Request unterwegs, endet sie mit 500 CONNECTION_ERROR -
+  /// deshalb nur bei etabliertem Gespräch und nicht während des Rufaufbaus verwenden.
+  void reconnectTransport() {
+    if (_ua == null) {
+      logger.w('reconnectTransport: UA not initialized');
+      return;
+    }
+    final SocketTransport? transport = _ua!.socketTransport;
+    if (transport == null) {
+      logger.w('reconnectTransport: no socket transport available');
+      return;
+    }
+    logger.i('reconnectTransport: force-reconnecting socket on current interface');
+    if (transport.isConnected() || transport.isConnecting()) {
+      transport.disconnect();
+    }
+    transport.connect();
   }
 
   void register() {
