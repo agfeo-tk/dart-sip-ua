@@ -421,6 +421,10 @@ class SIPUAHelper extends EventManager {
         'continualGatheringPolicy': _uaSettings?.iceGatherContinually == true
             ? 'gather_continually'
             : 'gather_once',
+        // Nur aufnehmen, wenn konfiguriert: fehlt der Schlüssel, bleibt es beim
+        // Vorgabewert von libwebrtc (siehe UaSettings.iceUnwritableTimeout).
+        if ((_uaSettings?.iceUnwritableTimeout ?? 0) > 0)
+          'iceUnwritableTimeout': _uaSettings!.iceUnwritableTimeout,
       },
       'mediaConstraints': <String, dynamic>{
         'audio': true,
@@ -1020,6 +1024,21 @@ class UaSettings {
   /// früher Restart würde dagegen eine Prüfliste abräumen, die kurz vor dem Erfolg steht.
   /// Ein gescheitertes Re-INVITE beendet das Gespräch nicht. Default false.
   bool iceRestartOnFailure = false;
+
+  /// Zeit in Millisekunden ohne Antwort, nach der libwebrtc den gewählten Pfad für
+  /// unbrauchbar erklärt und umnominiert. 0 = nicht setzen, dann bleibt es beim
+  /// Vorgabewert von libwebrtc (5 s).
+  ///
+  /// Der Vorgabewert bestimmt die Stille beim Netzwechsel: im Feldtest am 08.08.2026
+  /// antwortete das WLAN ab der ersten Stichprobe nicht mehr, während das
+  /// Mobilfunk-Kandidatenpaar schon `succeeded` war und jede Prüfung beantwortete –
+  /// libwebrtc hielt trotzdem sechs Sekunden am toten Pfad fest. Der Ersatz lag die
+  /// ganze Zeit bereit.
+  ///
+  /// Wirkt erst ab der nächsten PeerConnection, also ab dem nächsten Gespräch. Ein
+  /// niedrigerer Wert lässt einen Pfad schneller aufgeben – bei einer zeitweise zickigen
+  /// Leitung kann das zu wiederholtem Umnominieren führen.
+  int iceUnwritableTimeout = 0;
 
   /// Max interval between recovery connection, default 30 sec
   int connectionRecoveryMaxInterval = 30;
