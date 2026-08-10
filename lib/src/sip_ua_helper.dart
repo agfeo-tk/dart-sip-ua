@@ -479,6 +479,23 @@ class SIPUAHelper extends EventManager {
     return _ua!.sendOptions(target, body, params);
   }
 
+  /// Sendet den CRLF-Keepalive nach RFC 5626 Abschnitt 4.4.1 ueber den aktuellen Transport.
+  ///
+  /// Haelt eine untaetige Signalisierungsverbindung offen, ohne eine SIP-Transaktion zu
+  /// kosten. Ob es wirkt, haengt daran, dass die Gegenstelle mit einem CRLF antwortet -
+  /// pruefbar ueber [lastTransportDataAt].
+  ///
+  /// @return true, wenn gesendet wurde (Transport verbunden).
+  bool sendKeepAliveCrlf() {
+    return _ua?.socketTransport?.sendKeepAliveCrlf() ?? false;
+  }
+
+  /// Zeitpunkt der letzten eingehenden Transportdaten, oder null wenn noch keine kamen.
+  ///
+  /// Zaehlt jede Art von Verkehr der Gegenstelle, auch ein CRLF-Pong. Nur solcher Verkehr
+  /// setzt einen Read-Timeout in einem vorgeschalteten Proxy zurueck.
+  DateTime? get lastTransportDataAt => _ua?.socketTransport?.lastDataReceivedAt;
+
   void subscribe(String target, String event, String contentType) {
     Subscriber s = _ua!.subscribe(target, event, contentType);
 

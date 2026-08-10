@@ -161,6 +161,28 @@ class SocketTransport {
     return status == TransportStatus.connected;
   }
 
+  /// Zeitpunkt der letzten eingehenden Daten, egal welcher Art.
+  ///
+  /// Wird in [_onData] gesetzt, absichtlich VOR der CRLF-Sonderbehandlung, damit auch ein
+  /// reines Keepalive-Pong zaehlt. Dient dem Aufrufer als Nachweis, ob die Gegenstelle auf
+  /// einen Keepalive ueberhaupt antwortet - nur Verkehr VOM Server setzt einen
+  /// Read-Timeout in einem vorgeschalteten Proxy zurueck.
+  DateTime? lastDataReceivedAt;
+
+  /// Sendet den CRLF-Keepalive nach RFC 5626 Abschnitt 4.4.1 (doppeltes CRLF).
+  ///
+  /// Die Gegenstelle soll mit einem einzelnen CRLF antworten; die Antwort verwirft [_onData]
+  /// bereits. Anders als ein WebSocket-Ping-Rahmen bleibt ein unbeantworteter CRLF-Keepalive
+  /// folgenlos - er kann die Verbindung nicht abbauen.
+  ///
+  /// @return true, wenn gesendet wurde (Transport verbunden).
+  bool sendKeepAliveCrlf() {
+    if (!isConnected()) {
+      return false;
+    }
+    return send('\r\n\r\n');
+  }
+
   bool isConnecting() {
     return status == TransportStatus.connecting;
   }
@@ -272,6 +294,9 @@ class SocketTransport {
   }
 
   void _onData(dynamic data) {
+    // Vor jeder Auswertung: Verkehr von der Gegenstelle vermerken, auch ein CRLF-Pong.
+    lastDataReceivedAt = DateTime.now();
+
     // CRLF Keep Alive response from server. Ignore it.
     if (data == '\r\n') {
       logger.d('received message with CRLF Keep Alive response');
