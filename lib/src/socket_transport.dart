@@ -315,6 +315,17 @@ class SocketTransport {
         );
         return;
       }
+      // AGFEO: Der CRLF-Pong nach RFC 5626 4.4.1 kann als BINAERrahmen kommen - die AGFEO-
+      // Anlage tut genau das. Die Textpruefung oben greift dann nicht, und der leere Rest
+      // landet im SIP-Parser: "error parsing first line of SIP message". Im Feldtest vom
+      // 10.08.2026 alle 30 s eine solche Fehlermeldung. Geprueft wird auf leeren Inhalt und
+      // nicht nur auf '\r\n' - ein Rahmen ohne Nutzdaten ist in keinem Fall eine
+      // SIP-Nachricht, kann also gefahrlos verworfen werden.
+      if (data.trim().isEmpty) {
+        logger.d('received binary message with CRLF Keep Alive response');
+
+        return;
+      }
       logger.d('received binary message:\n\n$data\n');
     }
 
