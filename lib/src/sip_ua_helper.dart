@@ -896,6 +896,21 @@ class WebSocketSettings {
   /// Otherwise the used protocol will be used (for example WS for ws://
   /// or WSS for wss://, based on the given web socket URL).
   String? transport_scheme;
+
+  /// Abstand der WebSocket-Ping-Rahmen. `null` = kein Ping (bisheriges Verhalten).
+  ///
+  /// Während eines Gesprächs läuft über die Signalisierungsverbindung nichts – die Medien
+  /// gehen separat, ein Refresh-REGISTER erst nach der halben Gültigkeitsdauer. Ein
+  /// Read-Timeout im Pfad (nginx-Vorgabewert: 60 s) kappt die untätige Verbindung dann ohne
+  /// Close-Frame. Im Feldtest vom 10.08.2026 geschah das im Minutentakt: die Verbindung
+  /// lebte jeweils rund 61 s und wurde mit Code 1006 beendet, auf Android wie auf iOS
+  /// (dort 21 Mal in einer Sitzung).
+  ///
+  /// Achtung, der Wert ist zugleich die Antwortfrist: bleibt das Pong aus, schließt Dart die
+  /// Verbindung. Antwortet die Gegenstelle nicht auf Pings, wird also weiterhin geschlossen –
+  /// schlechter als bisher wird es dadurch nicht, solange der Wert unter der Timeout-Grenze
+  /// der Gegenseite liegt.
+  Duration? pingInterval;
 }
 
 class TcpSocketSettings {

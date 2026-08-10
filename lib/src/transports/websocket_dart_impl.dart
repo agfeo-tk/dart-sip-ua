@@ -33,6 +33,15 @@ class SIPUAWebSocketImpl {
             protocols: protocols, headers: webSocketSettings.extraHeaders);
       }
 
+      // Ping-Rahmen halten die untaetige Verbindung offen; siehe
+      // WebSocketSettings.pingInterval. Bewusst hinter beiden Verbindungswegen, damit es
+      // auch fuer allowBadCertificate greift - im Feld ist genau der aktiv.
+      if (webSocketSettings.pingInterval != null) {
+        _socket!.pingInterval = webSocketSettings.pingInterval;
+        logger.i('websocket ping interval set to '
+            '${webSocketSettings.pingInterval!.inSeconds}s');
+      }
+
       onOpen?.call();
       _socket!.listen((dynamic data) {
         onMessage?.call(data);
