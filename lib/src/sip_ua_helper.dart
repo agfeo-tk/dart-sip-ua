@@ -425,6 +425,10 @@ class SIPUAHelper extends EventManager {
         // Vorgabewert von libwebrtc (siehe UaSettings.iceUnwritableTimeout).
         if ((_uaSettings?.iceUnwritableTimeout ?? 0) > 0)
           'iceUnwritableTimeout': _uaSettings!.iceUnwritableTimeout,
+        // Zaehlt zusammen mit iceUnwritableTimeout - ohne diesen Wert bleibt das Zeitfenster
+        // wirkungslos (siehe UaSettings.iceUnwritableMinChecks).
+        if ((_uaSettings?.iceUnwritableMinChecks ?? 0) > 0)
+          'iceUnwritableMinChecks': _uaSettings!.iceUnwritableMinChecks,
       },
       'mediaConstraints': <String, dynamic>{
         'audio': true,
@@ -1071,6 +1075,22 @@ class UaSettings {
   /// niedrigerer Wert lässt einen Pfad schneller aufgeben – bei einer zeitweise zickigen
   /// Leitung kann das zu wiederholtem Umnominieren führen.
   int iceUnwritableTimeout = 0;
+
+  /// Anzahl unbeantworteter Pruefungen, nach der libwebrtc den gewaehlten Pfad fuer
+  /// unbrauchbar erklaeren darf. 0 = nicht setzen, dann bleibt es beim Vorgabewert von
+  /// libwebrtc (5).
+  ///
+  /// Wirkt ZUSAMMEN mit [iceUnwritableTimeout]: ein Pfad gilt erst als unbrauchbar, wenn
+  /// beide Bedingungen erfuellt sind. Deshalb blieb ein gesetztes Zeitfenster von 2 s im
+  /// Feldtest am 11.08.2026 ohne Wirkung - libwebrtc prueft ein stabil verbundenes Paar nur
+  /// etwa alle 2,5 s, fuenf Pruefungen dauern also deutlich laenger als die zwei Sekunden.
+  /// Gemessene Stille beim Wechsel: 6012 ms, obwohl das Ersatzpaar bereits `succeeded` war
+  /// und jede Pruefung beantwortete.
+  ///
+  /// Wirkt erst ab der naechsten PeerConnection. Ein niedriger Wert laesst einen Pfad
+  /// schneller aufgeben - bei einer zeitweise zickigen Leitung kann das zu wiederholtem
+  /// Umnominieren fuehren, deshalb nicht unter 2.
+  int iceUnwritableMinChecks = 0;
 
   /// Max interval between recovery connection, default 30 sec
   int connectionRecoveryMaxInterval = 30;
