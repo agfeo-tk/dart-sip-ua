@@ -1695,9 +1695,47 @@ class RTCSession extends EventManager implements Owner {
     constraints['optional'] ??= <dynamic>[];
 
     logger.w('Attempting ICE restart via re-INVITE');
+    // mediaConstraints mit video:false MUSS mit. renegotiate() leitet sonst in den
+    // Video-Upgrade-Zweig um; dessen Bedingung lautet
+    //   (mediaConstraints?['video'] != false || mediaConstraints?['mandatory']?['video'] != null)
+    //   && rtcOfferConstraints?['offerToReceiveVideo'] == null
+    // und ist ohne mediaConstraints wahr, weil null != false gilt. Im Feldtest vom 11.08.2026
+    // ging deshalb GAR KEIN Re-INVITE raus: nach "renegotiate()" folgten "Went to toggle mute
+    // video but local stream has no video tracks" und "sendVideoUpgradeReinvite()", danach
+    // nichts mehr - 7,5 s spaeter beendete die Karenzzeit das Gespraech. Mit video:false
+    // werden beide Teilbedingungen falsch und _sendReinvite() greift.
     return renegotiate(
-        options: <String, dynamic>{'rtcOfferConstraints': constraints},
+        options: <String, dynamic>{
+          'rtcOfferConstraints': constraints,
+          'mediaConstraints': <String, dynamic>{'video': false},
+        },
         terminateOnFailure: false);
+  }
+
+  /// Zieht die Karenzzeit nach "failed" neu auf und beendet das Gespraech, wenn ICE bis dahin
+  /// nicht wieder steht.
+  ///
+  /// Wird zweimal gerufen: beim Eintritt in "failed" und noch einmal, wenn ein ICE-Restart
+  /// tatsaechlich abgesetzt wurde. Ein laufender Timer wird dabei ersetzt, damit dem Restart
+  /// die volle Frist bleibt.
+  ///
+  /// @param graceMs Karenzzeit in Millisekunden.
+  void _restartIceFailedGraceTimer(int graceMs) {
+    _iceFailedGraceTimer?.cancel();
+    _iceFailedGraceTimer = Timer(Duration(milliseconds: graceMs), () {
+      _iceFailedGraceTimer = null;
+      final RTCIceConnectionState? now = _connection?.iceConnectionState;
+      if (_state == RtcSessionState.terminated || _state == RtcSessionState.canceled) {
+        return;
+      }
+      if (now == RTCIceConnectionState.RTCIceConnectionStateConnected ||
+          now == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
+        logger.i('ICE recovered during grace period ($now), call continues');
+        return;
+      }
+      logger.e('ICE still not usable after grace period ($now), terminating');
+      _terminateOnIceFailure();
+    });
   }
 
   /// Bricht den geplanten ICE-Restart ab und gibt die Referenz frei.
@@ -1786,23 +1824,18 @@ class RTCSession extends EventManager implements Owner {
               // Sonst wuerde jedes weitere "failed" ein Re-INVITE nachschieben, waehrend
               // gar kein Netz traegt.
               _iceRestartAttempted = true;
-              _iceRestart();
+              // Gelingt das Absetzen, die Karenzzeit neu aufziehen: sonst bleibt dem Restart
+              // nur die halbe Frist, und die reicht nicht fuer Re-INVITE-Umlauf, frisches
+              // Gathering und Pruefungen. Im Feldtest vom 11.08.2026 lagen zwischen Restart
+              // und Abbruch 7,5 s. Der Timer prueft ohnehin, ob ICE inzwischen steht, ein
+              // laengeres Fenster verzoegert also nur den Abbruch eines Gespraechs, das
+              // sowieso tot ist.
+              if (_iceRestart()) {
+                _restartIceFailedGraceTimer(graceMs);
+              }
             });
           }
-          _iceFailedGraceTimer = Timer(Duration(milliseconds: graceMs), () {
-            _iceFailedGraceTimer = null;
-            final RTCIceConnectionState? now = _connection?.iceConnectionState;
-            if (_state == RtcSessionState.terminated || _state == RtcSessionState.canceled) {
-              return;
-            }
-            if (now == RTCIceConnectionState.RTCIceConnectionStateConnected ||
-                now == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
-              logger.i('ICE recovered during grace period ($now), call continues');
-              return;
-            }
-            logger.e('ICE still not usable after grace period ($now), terminating');
-            _terminateOnIceFailure();
-          });
+          _restartIceFailedGraceTimer(graceMs);
         }
       } else if (state ==
           RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
