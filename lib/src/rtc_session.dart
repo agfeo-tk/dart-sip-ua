@@ -2434,8 +2434,13 @@ class RTCSession extends EventManager implements Owner {
     emit(EventSdp(
         originator: Originator.remote, type: SdpType.offer, sdp: processedSDP));
 
+    // Fehlende BUNDLE-Attribute aus der bestehenden Aushandlung ergaenzen -
+    // nur fuer In-Dialog-Offers und nur, wenn eindeutig rekonstruierbar
+    // (siehe _restoreBundleAttributes). Der Erstaufbau ist nicht betroffen.
+    final String? patchedSDP = await _restoreBundleAttributes(processedSDP);
+
     RTCSessionDescription offer =
-        RTCSessionDescription(processedSDP, SdpType.offer.name);
+        RTCSessionDescription(patchedSDP, SdpType.offer.name);
 
     if (_state == RtcSessionState.terminated) {
       throw Exceptions.InvalidStateError('terminated');
@@ -3481,6 +3486,86 @@ class RTCSession extends EventManager implements Owner {
     sdp['media'] = mediaList;
 
     return sdp_transform.write(sdp, null);
+  }
+
+  /// Ergänzt in einem In-Dialog-Offer fehlende BUNDLE-Attribute aus der
+  /// bestehenden Aushandlung.
+  ///
+  /// Minimalistische Gegenstellen (z. B. eine ice-lite-Anlage) senden ihr
+  /// Restart-Re-INVITE ohne `a=group:BUNDLE` und `a=mid`, obwohl die Session
+  /// mit BUNDLE ausgehandelt wurde. libwebrtc wertet das als Entfernen der
+  /// m-Line aus der etablierten BUNDLE-Gruppe und verweigert die eigene
+  /// Antwort ("Answer cannot remove m= section with mid=... from
+  /// already-established BUNDLE group"), worauf ein 500 rausginge (#614).
+  ///
+  /// Ergänzt wird nur, wenn eindeutig rekonstruierbar:
+  /// - es gibt bereits eine Remote-Description (In-Dialog),
+  /// - das Offer enthält weder Gruppen noch mids,
+  /// - die bisherige Remote-Description hat eine BUNDLE-Gruppe,
+  /// - die m-Lines stimmen in Anzahl und Typ überein und hatten alle eine mid.
+  /// In allen anderen Fällen - und bei jedem Fehler - bleibt das Offer
+  /// unverändert (fail-open, Verhalten wie bisher).
+  ///
+  /// @param offerSdp Das bereits für WebRTC aufbereitete Offer.
+  /// @return Das ggf. um `a=group:BUNDLE`/`a=mid` ergänzte Offer.
+  Future<String?> _restoreBundleAttributes(String? offerSdp) async {
+    if (offerSdp == null || _connection == null) {
+      return offerSdp;
+    }
+    try {
+      RTCSessionDescription? previousRemote =
+          await _connection!.getRemoteDescription();
+      if (previousRemote?.sdp == null) {
+        return offerSdp; // Erstaufbau - nichts zu rekonstruieren
+      }
+
+      Map<String, dynamic> offer = sdp_transform.parse(offerSdp);
+      List<dynamic> offerMedia = offer['media'] ?? <dynamic>[];
+      bool offerHasGroups =
+          (offer['groups'] as List<dynamic>?)?.isNotEmpty == true;
+      bool offerHasMids = offerMedia.any((dynamic m) => m['mid'] != null);
+      if (offerHasGroups || offerHasMids || offerMedia.isEmpty) {
+        return offerSdp; // Offer bringt eigene Gruppierung mit - nicht anfassen
+      }
+
+      Map<String, dynamic> previous =
+          sdp_transform.parse(previousRemote!.sdp!);
+      List<dynamic> previousBundleGroups =
+          (previous['groups'] as List<dynamic>? ?? <dynamic>[])
+              .where((dynamic g) =>
+                  (g['type']?.toString().toUpperCase() ?? '') == 'BUNDLE')
+              .toList();
+      List<dynamic> previousMedia = previous['media'] ?? <dynamic>[];
+      if (previousBundleGroups.isEmpty) {
+        return offerSdp; // Session wurde ohne BUNDLE ausgehandelt
+      }
+      if (previousMedia.length != offerMedia.length) {
+        logger.w('restoreBundleAttributes() | m-Line-Anzahl geändert '
+            '(${previousMedia.length} -> ${offerMedia.length}) - Offer bleibt unverändert');
+        return offerSdp;
+      }
+      for (int i = 0; i < offerMedia.length; i++) {
+        if (offerMedia[i]['type'] != previousMedia[i]['type'] ||
+            previousMedia[i]['mid'] == null) {
+          logger.w('restoreBundleAttributes() | m-Lines nicht eindeutig '
+              'zuordenbar - Offer bleibt unverändert');
+          return offerSdp;
+        }
+      }
+
+      for (int i = 0; i < offerMedia.length; i++) {
+        offerMedia[i]['mid'] = previousMedia[i]['mid'];
+      }
+      offer['groups'] = previousBundleGroups;
+      logger.i('restoreBundleAttributes() | fehlende BUNDLE-Attribute aus '
+          'bestehender Aushandlung ergänzt (mids: '
+          '${previousMedia.map((dynamic m) => m['mid']).join(' ')})');
+      return sdp_transform.write(offer, null);
+    } catch (error) {
+      logger.w('restoreBundleAttributes() | Fehler beim Ergänzen, Offer '
+          'bleibt unverändert: $error');
+      return offerSdp;
+    }
   }
 
   void _setLocalMediaStatus() {
