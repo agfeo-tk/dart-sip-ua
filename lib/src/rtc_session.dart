@@ -2477,8 +2477,15 @@ class RTCSession extends EventManager implements Owner {
     }
 
     try {
-      return await _createLocalDescription(
+      RTCSessionDescription answer = await _createLocalDescription(
           SdpType.answer, _rtcAnswerConstraints);
+      // Nur lokal ergänzte BUNDLE-Attribute wieder aus der Draht-Antwort
+      // entfernen - der Offerer hat sie nie angeboten und würde sie ablehnen.
+      if (_bundleAttributesInjected) {
+        return RTCSessionDescription(
+            _stripBundleAttributes(answer.sdp), answer.type);
+      }
+      return answer;
     } catch (_) {
       request.reply(500);
       throw Exceptions.TypeError('_createLocalDescription() failed');
@@ -3506,9 +3513,17 @@ class RTCSession extends EventManager implements Owner {
   /// In allen anderen Fällen - und bei jedem Fehler - bleibt das Offer
   /// unverändert (fail-open, Verhalten wie bisher).
   ///
+  /// true, wenn [_restoreBundleAttributes] beim zuletzt verarbeiteten
+  /// In-Dialog-Offer BUNDLE-Attribute ergänzt hat. Dann müssen sie aus der
+  /// Antwort auf dem Draht wieder entfernt werden ([_stripBundleAttributes]):
+  /// Der Offerer hat BUNDLE nie angeboten und würde eine Antwort mit
+  /// unbekannter mid ablehnen (OPAL: "Could not match mid" -> Abbau mit 486).
+  bool _bundleAttributesInjected = false;
+
   /// @param offerSdp Das bereits für WebRTC aufbereitete Offer.
   /// @return Das ggf. um `a=group:BUNDLE`/`a=mid` ergänzte Offer.
   Future<String?> _restoreBundleAttributes(String? offerSdp) async {
+    _bundleAttributesInjected = false;
     if (offerSdp == null || _connection == null) {
       return offerSdp;
     }
@@ -3557,6 +3572,7 @@ class RTCSession extends EventManager implements Owner {
         offerMedia[i]['mid'] = previousMedia[i]['mid'];
       }
       offer['groups'] = previousBundleGroups;
+      _bundleAttributesInjected = true;
       logger.i('restoreBundleAttributes() | fehlende BUNDLE-Attribute aus '
           'bestehender Aushandlung ergänzt (mids: '
           '${previousMedia.map((dynamic m) => m['mid']).join(' ')})');
@@ -3565,6 +3581,45 @@ class RTCSession extends EventManager implements Owner {
       logger.w('restoreBundleAttributes() | Fehler beim Ergänzen, Offer '
           'bleibt unverändert: $error');
       return offerSdp;
+    }
+  }
+
+  /// Entfernt `a=group:BUNDLE` und `a=mid` aus einer Antwort-SDP.
+  ///
+  /// Gegenstück zu [_restoreBundleAttributes]: Hat der Offerer kein BUNDLE
+  /// angeboten (die Attribute wurden nur lokal für libwebrtc ergänzt), darf
+  /// die Antwort auf dem Draht sie auch nicht enthalten - eine Antwort mit
+  /// unbekannter mid lehnt z. B. OPAL ab ("Could not match mid") und baut
+  /// das Gespräch ab. Die lokale Description in libwebrtc bleibt unberührt,
+  /// entfernt wird nur in der per SIP verschickten Kopie.
+  ///
+  /// @param sdpInput Die Antwort-SDP aus der lokalen Description.
+  /// @return Die Antwort ohne BUNDLE-Gruppen und mids (bei Fehlern unverändert).
+  String? _stripBundleAttributes(String? sdpInput) {
+    if (sdpInput == null) {
+      return sdpInput;
+    }
+    try {
+      // Bewusst zeilenbasiert statt über sdp_transform: der parse/write-Umweg
+      // verliert Attribut-Details (z. B. "renomination" aus a=ice-options),
+      // hier bleibt alles außer den entfernten Zeilen byte-identisch.
+      final RegExp bundleLine = RegExp(r'^a=(group:BUNDLE(\s|$)|mid:)');
+      final List<String> kept = <String>[];
+      for (final String line in sdpInput.split('\n')) {
+        final String probe =
+            line.endsWith('\r') ? line.substring(0, line.length - 1) : line;
+        if (bundleLine.hasMatch(probe)) {
+          continue;
+        }
+        kept.add(line);
+      }
+      logger.i('stripBundleAttributes() | BUNDLE-Attribute aus der Antwort '
+          'entfernt (Offerer hat kein BUNDLE angeboten)');
+      return kept.join('\n');
+    } catch (error) {
+      logger.w('stripBundleAttributes() | Fehler beim Entfernen, Antwort '
+          'bleibt unverändert: $error');
+      return sdpInput;
     }
   }
 
