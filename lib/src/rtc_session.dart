@@ -1943,6 +1943,29 @@ class RTCSession extends EventManager implements Owner {
     return;
   }
 
+  /// Extrahiert das ice-ufrag-Attribut aus einer SDP.
+  ///
+  /// @param sdp Die SDP als Text (darf null sein).
+  /// @return Das erste gefundene ufrag oder null, wenn keines enthalten ist.
+  String? _extractIceUfrag(String? sdp) {
+    if (sdp == null) {
+      return null;
+    }
+    return RegExp(r'a=ice-ufrag:(\S+)').firstMatch(sdp)?.group(1);
+  }
+
+  /// Erzeugt die lokale Description (Offer oder Answer) und wartet auf das
+  /// ICE-Gathering, bevor sie zurueckgegeben wird.
+  ///
+  /// Nach einem ICE-Restart (neues ufrag, z. B. durch ein Re-INVITE der
+  /// Gegenseite oder ein eigenes Restart-Offer) beginnt libwebrtc ein neues
+  /// Gathering; der gecachte _iceGatheringState vom vorherigen Gathering wird
+  /// dann zurueckgesetzt, damit die SDP nicht ohne Candidates (c=0.0.0.0,
+  /// Port 9) verschickt wird (#614).
+  ///
+  /// @param type SdpType.offer oder SdpType.answer.
+  /// @param constraints Constraints fuer createOffer/createAnswer.
+  /// @return Die lokale Description inklusive gesammelter Candidates.
   Future<RTCSessionDescription> _createLocalDescription(
       SdpType type, Map<String, dynamic>? constraints) async {
     logger.d('createLocalDescription()');
@@ -1997,6 +2020,27 @@ class RTCSession extends EventManager implements Owner {
       desc = await modifier(desc);
     }
 
+    // ICE-Restart erkennen: hat die neue Description ein anderes ufrag als die
+    // bisherige lokale Description, startet libwebrtc mit setLocalDescription()
+    // ein neues Gathering. Der gecachte _iceGatheringState stammt dann noch vom
+    // alten Gathering ("complete") und wuerde unten den Sofort-Versand einer
+    // SDP ohne Candidates freischalten (#614).
+    try {
+      RTCSessionDescription? previousLocal =
+          await _connection!.getLocalDescription();
+      String? previousUfrag = _extractIceUfrag(previousLocal?.sdp);
+      String? newUfrag = _extractIceUfrag(desc.sdp);
+      if (previousUfrag != null &&
+          newUfrag != null &&
+          previousUfrag != newUfrag) {
+        logger.d(
+            'createLocalDescription() | ICE-Restart erkannt (ufrag $previousUfrag -> $newUfrag), Gathering-Zustand zurueckgesetzt');
+        _iceGatheringState = RTCIceGatheringState.RTCIceGatheringStateNew;
+      }
+    } catch (_) {
+      // Keine bisherige lokale Description (Erstaufbau) - nichts zu tun.
+    }
+
     Future<void> ready() async {
       if (!finished && _state != RtcSessionState.terminated) {
         finished = true;
@@ -2049,13 +2093,28 @@ class RTCSession extends EventManager implements Owner {
     }
 
     // Resolve right away if 'pc.iceGatheringState' is 'complete'.
+    // Zusaetzliche Absicherung zu der ufrag-Pruefung oben: Nur sofort
+    // aufloesen, wenn die lokale Description tatsaechlich Candidates enthaelt.
+    // Nach einem ICE-Restart meldet der gecachte Zustand sonst "complete",
+    // obwohl das neue Gathering gerade erst begonnen hat (#614).
     if (_iceGatheringState ==
         RTCIceGatheringState.RTCIceGatheringStateComplete) {
-      _rtcReady = true;
       RTCSessionDescription? desc = await _connection!.getLocalDescription();
-      logger.d('emit "sdp"');
-      emit(EventSdp(originator: Originator.local, type: type, sdp: desc!.sdp));
-      return desc;
+      if (desc?.sdp?.contains('a=candidate:') == true) {
+        _rtcReady = true;
+        logger.d('emit "sdp"');
+        emit(
+            EventSdp(originator: Originator.local, type: type, sdp: desc!.sdp));
+        return desc;
+      }
+      logger.w(
+          'createLocalDescription() | Gathering meldet "complete", aber die Description enthaelt keine Candidates - warte auf das neue Gathering');
+      // Auffangtimer, damit der Aufrufer nicht ewig haengt, falls weder
+      // Candidates noch ein "complete"-Ereignis eintreffen (z. B. ohne Netz).
+      int guardMs = ua.configuration.ice_gathering_timeout != 0
+          ? ua.configuration.ice_gathering_timeout * 4
+          : 2000;
+      setTimeout(() => ready(), guardMs);
     }
 
     return completer.future;
