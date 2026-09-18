@@ -1963,6 +1963,11 @@ class RTCSession extends EventManager implements Owner {
   /// dann zurueckgesetzt, damit die SDP nicht ohne Candidates (c=0.0.0.0,
   /// Port 9) verschickt wird (#614).
   ///
+  /// Bei einem Offer wird nicht auf den festen ice_gathering_timeout gewartet,
+  /// sobald ein Relay-Kandidat (typ relay) vorliegt - die Description wird
+  /// dann sofort aufgeloest, da der Relay-Kandidat der langsamste, aber fuer
+  /// Rufe ueber das Anlagen-Relay entscheidende Kandidat ist.
+  ///
   /// @param type SdpType.offer oder SdpType.answer.
   /// @param constraints Constraints fuer createOffer/createAnswer.
   /// @return Die lokale Description inklusive gesammelter Candidates.
@@ -2067,6 +2072,20 @@ class RTCSession extends EventManager implements Owner {
     _connection!.onIceCandidate = (RTCIceCandidate candidate) {
       if (candidate != null) {
         emit(EventIceCandidate(candidate, ready));
+        // AGFEO: Sobald ein Relay-Kandidat (typ relay) gesammelt wurde, das Offer sofort
+        // verschicken, statt den festen ice_gathering_timeout abzuwarten. Der Relay-Kandidat
+        // ist bei Rufen ueber das Anlagen-Relay der entscheidende und zugleich langsamste
+        // Kandidat (TURN-Allocate-Roundtrip); der feste Timeout verschickt das INVITE sonst
+        // oft host-only, bevor der Relay-Kandidat vorliegt. ready() ist ueber sein
+        // finished-Flag idempotent - weitere Kandidaten und ein spaeteres "complete" sind
+        // dann No-ops. Nur fuer Offer, nicht fuer Answer.
+        if (type == SdpType.offer &&
+            candidate.candidate != null &&
+            candidate.candidate!.contains(' typ relay')) {
+          logger.d(
+              'createLocalDescription() | Relay-Kandidat vorhanden, Offer wird sofort verschickt');
+          ready();
+        }
         if (!hasCandidate) {
           hasCandidate = true;
           /**
