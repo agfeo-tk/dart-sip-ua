@@ -1966,7 +1966,12 @@ class RTCSession extends EventManager implements Owner {
   /// Bei einem Offer wird nicht auf den festen ice_gathering_timeout gewartet,
   /// sobald ein Relay-Kandidat (typ relay) vorliegt - die Description wird
   /// dann sofort aufgeloest, da der Relay-Kandidat der langsamste, aber fuer
-  /// Rufe ueber das Anlagen-Relay entscheidende Kandidat ist.
+  /// Rufe ueber das Anlagen-Relay entscheidende Kandidat ist. Ebenso wird ein
+  /// oeffentlicher (srflx-)Kandidat sofort verschickt, da er der Gegenstelle
+  /// (Anlagen-Relay) fuer eine vorab angelegte TURN-Permission reicht. Liegt
+  /// nach dem festen Timeout noch kein oeffentlicher Kandidat vor (z. B.
+  /// langsamer STUN-Server im Mobilfunk), wird einmalig um das Dreifache
+  /// verlaengert, bevor bedingungslos - also auch host-only - aufgeloest wird.
   ///
   /// @param type SdpType.offer oder SdpType.answer.
   /// @param constraints Constraints fuer createOffer/createAnswer.
@@ -2069,9 +2074,51 @@ class RTCSession extends EventManager implements Owner {
     };
 
     bool hasCandidate = false;
+    // AGFEO: haelt fest, ob bereits ein oeffentlicher Kandidat (srflx oder
+    // relay) gesammelt wurde - siehe scheduleGatheringFallback() und die
+    // Sofort-ready()-Zweige im onIceCandidate-Handler unten.
+    bool hasPublicCandidate = false;
+
+    /// Fallback-Timer fuer das ICE-Gathering, gestartet beim ersten Kandidaten.
+    ///
+    /// Beim Answer bleibt das Verhalten unveraendert: fester Timeout, danach
+    /// ready(). Beim Offer reicht der feste Timeout allein nicht mehr aus, da
+    /// Host-Kandidaten synchron vor dem STUN-Roundtrip vorliegen, waehrend der
+    /// oeffentliche (srflx-)Kandidat - den die Gegenstelle (Anlagen-Relay) fuer
+    /// eine vorab angelegte TURN-Permission braucht - im Mobilfunk oft laenger
+    /// als der Default-Timeout von 500 ms benoetigt. Liegt nach dem ersten
+    /// Timeout noch kein oeffentlicher Kandidat vor, wird deshalb einmalig um
+    /// das Dreifache verlaengert (insgesamt 4x ice_gathering_timeout), bevor
+    /// bedingungslos - also auch host-only, z. B. ohne erreichbaren STUN-Server -
+    /// aufgeloest wird.
+    void scheduleGatheringFallback() {
+      int timeout = ua.configuration.ice_gathering_timeout;
+      if (type != SdpType.offer) {
+        setTimeout(() => ready(), timeout);
+        return;
+      }
+      setTimeout(() {
+        if (hasPublicCandidate) {
+          ready();
+          return;
+        }
+        int maxWait = timeout * 4;
+        logger.d(
+            'createLocalDescription() | Nach $timeout ms noch kein oeffentlicher Kandidat, warte bis maximal $maxWait ms');
+        setTimeout(() => ready(), timeout * 3);
+      }, timeout);
+    }
+
     _connection!.onIceCandidate = (RTCIceCandidate candidate) {
       if (candidate != null) {
         emit(EventIceCandidate(candidate, ready));
+        bool isRelayCandidate = candidate.candidate != null &&
+            candidate.candidate!.contains(' typ relay');
+        bool isSrflxCandidate = candidate.candidate != null &&
+            candidate.candidate!.contains(' typ srflx');
+        if (isRelayCandidate || isSrflxCandidate) {
+          hasPublicCandidate = true;
+        }
         // AGFEO: Sobald ein Relay-Kandidat (typ relay) gesammelt wurde, das Offer sofort
         // verschicken, statt den festen ice_gathering_timeout abzuwarten. Der Relay-Kandidat
         // ist bei Rufen ueber das Anlagen-Relay der entscheidende und zugleich langsamste
@@ -2079,11 +2126,21 @@ class RTCSession extends EventManager implements Owner {
         // oft host-only, bevor der Relay-Kandidat vorliegt. ready() ist ueber sein
         // finished-Flag idempotent - weitere Kandidaten und ein spaeteres "complete" sind
         // dann No-ops. Nur fuer Offer, nicht fuer Answer.
-        if (type == SdpType.offer &&
-            candidate.candidate != null &&
-            candidate.candidate!.contains(' typ relay')) {
+        if (type == SdpType.offer && isRelayCandidate) {
           logger.d(
               'createLocalDescription() | Relay-Kandidat vorhanden, Offer wird sofort verschickt');
+          ready();
+        }
+        // AGFEO: Ein oeffentlicher (srflx-)Kandidat reicht der Gegenstelle
+        // (Anlagen-Relay mit TURN) bereits, um vorab eine Permission fuer
+        // diese Adresse anzulegen - der eigene Relay-Kandidat wird dafuer
+        // nicht benoetigt und kommt ohnehin erst spaeter (zwei zusaetzliche
+        // Roundtrips). Host-Kandidaten liegen zu diesem Zeitpunkt bereits vor,
+        // da sie synchron vor dem STUN-Roundtrip gemeldet werden. Nur fuer
+        // Offer, nicht fuer Answer.
+        if (type == SdpType.offer && isSrflxCandidate) {
+          logger.d(
+              'createLocalDescription() | Oeffentlicher Kandidat (srflx) vorhanden, Offer wird verschickt');
           ready();
         }
         if (!hasCandidate) {
@@ -2095,7 +2152,7 @@ class RTCSession extends EventManager implements Owner {
            * initiating a call to answer the call waiting will be unacceptable.
            */
           if (ua.configuration.ice_gathering_timeout != 0) {
-            setTimeout(() => ready(), ua.configuration.ice_gathering_timeout);
+            scheduleGatheringFallback();
           }
         }
       }
