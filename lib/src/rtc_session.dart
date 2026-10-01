@@ -134,6 +134,15 @@ class RTCSession extends EventManager implements Owner {
   // SIP Timers.
   final SIPTimers _timers = SIPTimers();
 
+  // AGFEO: wird in _close() aufgerufen, BEVOR die RTCPeerConnection geschlossen wird – bei
+  // jedem Sitzungsende (lokales/fernes Auflegen, Fehlschlag), und zwar noch vor den Events
+  // "ended"/"failed". Erlaubt der App z. B. eine letzte getStats()-Abfrage an der noch offenen
+  // Verbindung. Der Abbau wartet höchstens [beforeConnectionCloseTimeout] auf den Hook.
+  Future<void> Function(RTCPeerConnection connection)? onBeforeConnectionClose;
+
+  // AGFEO: Obergrenze, wie lange _close() auf [onBeforeConnectionClose] wartet.
+  static const Duration beforeConnectionCloseTimeout = Duration(seconds: 1);
+
   // Session info.
   Direction? _direction;
   NameAddrHeader? _local_identity;
@@ -1560,6 +1569,19 @@ class RTCSession extends EventManager implements Owner {
     _state = RtcSessionState.terminated;
     // Terminate RTC.
     if (_connection != null) {
+      // AGFEO: Hook vor dem Schließen der Verbindung. Der Aufruf läuft synchron bis zum
+      // ersten await des Hooks, also noch bevor _ended()/_failed() ihr Event senden.
+      final Future<void> Function(RTCPeerConnection)? beforeClose =
+          onBeforeConnectionClose;
+      if (beforeClose != null) {
+        try {
+          await beforeClose(_connection!)
+              .timeout(beforeConnectionCloseTimeout);
+        } catch (error) {
+          logger.w(
+              'close() | onBeforeConnectionClose failed: ${error.toString()}');
+        }
+      }
       try {
         await _connection!.close();
         await _connection!.dispose();

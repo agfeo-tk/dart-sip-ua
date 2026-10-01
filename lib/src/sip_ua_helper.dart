@@ -40,6 +40,12 @@ class SIPUAHelper extends EventManager {
   UaSettings? _uaSettings;
   final Map<String?, Call> _calls = <String?, Call>{};
 
+  /// AGFEO: wird bei jedem Sitzungsende aufgerufen, bevor die PeerConnection des Anrufs
+  /// geschlossen wird – noch vor den Call-States ENDED/FAILED. [Call.peerConnection] ist
+  /// in diesem Moment noch offen (z. B. für eine letzte getStats()-Abfrage). Der Abbau
+  /// wartet höchstens [RTCSession.beforeConnectionCloseTimeout] auf den Hook.
+  Future<void> Function(Call call)? onBeforeMediaClose;
+
   RegistrationState _registerState =
       RegistrationState(state: RegistrationStateEnum.NONE);
 
@@ -287,8 +293,16 @@ class SIPUAHelper extends EventManager {
         }
         bool hasVideo = session.data?['video'] ?? false;
 
-        _calls[event.id] =
+        final Call call =
             Call(event.id, session, CallStateEnum.CALL_INITIATION, !hasVideo);
+        _calls[event.id] = call;
+        // AGFEO: Hook vor dem Schließen der PeerConnection an die App durchreichen.
+        session.onBeforeConnectionClose = (RTCPeerConnection _) async {
+          final Future<void> Function(Call)? hook = onBeforeMediaClose;
+          if (hook != null) {
+            await hook(call);
+          }
+        };
         _notifyCallStateListeners(
             event,
             CallState(CallStateEnum.CALL_INITIATION,
