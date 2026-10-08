@@ -2100,6 +2100,10 @@ class RTCSession extends EventManager implements Owner {
     // relay) gesammelt wurde - siehe scheduleGatheringFallback() und die
     // Sofort-ready()-Zweige im onIceCandidate-Handler unten.
     bool hasPublicCandidate = false;
+    // AGFEO: wurde nach einem srflx-Kandidaten eine begrenzte Wartezeit auf einen
+    // relay-Kandidaten eingeplant (ice_relay_grace_timeout > 0)? Dann darf der
+    // Gathering-Fallback nicht vorzeitig ready() rufen.
+    bool relayGraceScheduled = false;
 
     /// Fallback-Timer fuer das ICE-Gathering, gestartet beim ersten Kandidaten.
     ///
@@ -2121,7 +2125,10 @@ class RTCSession extends EventManager implements Owner {
       }
       setTimeout(() {
         if (hasPublicCandidate) {
-          ready();
+          // Laeuft die Relay-Karenzzeit, erledigt deren Timer das ready().
+          if (!relayGraceScheduled) {
+            ready();
+          }
           return;
         }
         int maxWait = timeout * 4;
@@ -2160,10 +2167,23 @@ class RTCSession extends EventManager implements Owner {
         // Roundtrips). Host-Kandidaten liegen zu diesem Zeitpunkt bereits vor,
         // da sie synchron vor dem STUN-Roundtrip gemeldet werden. Nur fuer
         // Offer, nicht fuer Answer.
+        // Mit ice_relay_grace_timeout > 0 wird nach dem srflx-Kandidaten noch begrenzt
+        // auf einen Relay-Kandidaten gewartet; trifft er ein, ruft der Zweig oben sofort
+        // ready(). 0 = sofort verschicken (bisheriges Verhalten).
         if (type == SdpType.offer && isSrflxCandidate) {
-          logger.d(
-              'createLocalDescription() | Oeffentlicher Kandidat (srflx) vorhanden, Offer wird verschickt');
-          ready();
+          final int relayGrace = ua.configuration.ice_relay_grace_timeout;
+          if (relayGrace <= 0) {
+            logger.d(
+                'createLocalDescription() | Oeffentlicher Kandidat (srflx) vorhanden, Offer wird verschickt');
+            ready();
+          } else if (!relayGraceScheduled) {
+            relayGraceScheduled = true;
+            logger.d(
+                'createLocalDescription() | Oeffentlicher Kandidat (srflx) vorhanden, warte bis zu $relayGrace ms auf Relay-Kandidat');
+            setTimeout(() {
+              ready();
+            }, relayGrace);
+          }
         }
         if (!hasCandidate) {
           hasCandidate = true;

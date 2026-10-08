@@ -69,6 +69,11 @@ class Settings {
   /// Verhalten). Erholt sich ICE innerhalb der Zeit, laeuft das Gespraech weiter.
   int ice_failed_grace_timeout = 0;
 
+  /// Karenzzeit in Millisekunden, die beim SDP-Offer nach einem srflx-Kandidaten noch auf
+  /// einen relay-Kandidaten gewartet wird, bevor das Offer gesendet wird. 0 = sofort senden
+  /// (bisheriges Verhalten).
+  int ice_relay_grace_timeout = 0;
+
   /// Frist in Millisekunden, innerhalb der ein gesendeter REGISTER eine endgueltige
   /// Antwort bekommen muss. Laeuft sie ab, wird der Versuch als fehlgeschlagen
   /// gemeldet, ohne auf den TCP-Stack oder Timer F zu warten. 0 = aus (bisheriges
@@ -278,6 +283,11 @@ class Checks {
     'ice_failed_grace_timeout': (Settings src, Settings? dst) {
       if (src.ice_failed_grace_timeout >= 0) {
         dst!.ice_failed_grace_timeout = src.ice_failed_grace_timeout;
+      }
+    },
+    'ice_relay_grace_timeout': (Settings src, Settings? dst) {
+      if (src.ice_relay_grace_timeout >= 0) {
+        dst!.ice_relay_grace_timeout = src.ice_relay_grace_timeout;
       }
     },
     'register_response_timeout': (Settings src, Settings? dst) {

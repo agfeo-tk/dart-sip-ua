@@ -223,6 +223,7 @@ class SIPUAHelper extends EventManager {
     _settings.session_timers = uaSettings.sessionTimers;
     _settings.ice_gathering_timeout = uaSettings.iceGatheringTimeout;
     _settings.ice_failed_grace_timeout = uaSettings.iceFailedGraceTimeout;
+    _settings.ice_relay_grace_timeout = uaSettings.iceRelayGraceTimeout;
     _settings.register_response_timeout = uaSettings.registerResponseTimeout;
     _settings.ice_restart_on_failure = uaSettings.iceRestartOnFailure;
     _settings.session_timers_refresh_method =
@@ -1053,6 +1054,12 @@ class UaSettings {
   /// 06.08.2026 wurde ein Gespräch 10,5 s nach `disconnected` beendet, während der neue
   /// WLAN-Pfad 7 s später tragfähig geworden wäre – reines Abwarten hätte gereicht.
   int iceFailedGraceTimeout = 0;
+
+  /// Karenzzeit in Millisekunden, die beim SDP-Offer nach einem srflx-Kandidaten noch auf
+  /// einen relay-Kandidaten gewartet wird, bevor das Offer gesendet wird. Trifft der
+  /// Relay-Kandidat früher ein, wird sofort gesendet. 0 = sofort nach dem srflx-Kandidaten
+  /// senden (bisheriges Verhalten).
+  int iceRelayGraceTimeout = 0;
 
   /// Kandidaten kontinuierlich sammeln (continualGatheringPolicy: gather_continually).
   /// Nötig für nahtlose Netzwechsel (5G↔WLAN) im laufenden Gespräch: libwebrtc sammelt
