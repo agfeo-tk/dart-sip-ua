@@ -1734,6 +1734,30 @@ class RTCSession extends EventManager implements Owner {
         terminateOnFailure: false);
   }
 
+  /// Stoesst auf Wunsch der Anwendung einen ICE-Restart per Re-INVITE an, z. B. kurz nach
+  /// einem Netzwechsel, wenn die Medien nicht von allein zurueckkommen.
+  ///
+  /// Nutzt denselben Weg wie der automatische Restart ([_iceRestart]), wartet aber nicht auf
+  /// "failed" plus halbe Karenzzeit (im Feldtest vom 10.10.2026 rund 22 s Stille). Die
+  /// automatischen Timer bleiben unveraendert. Laeuft bereits die Karenzzeit nach "failed",
+  /// wird sie neu aufgezogen, damit dem Restart die volle Frist bleibt.
+  ///
+  /// @return true, wenn ein Re-INVITE abgesetzt wurde; false, wenn das Gespraech nicht
+  ///         bestaetigt ist, der Transport fehlt oder eine andere Transaktion laeuft.
+  bool requestIceRestart() {
+    if (_state != RtcSessionState.confirmed) {
+      logger.d('requestIceRestart() | session not confirmed ($_state)');
+      return false;
+    }
+    if (!_iceRestart()) {
+      return false;
+    }
+    if (_iceFailedGraceTimer != null) {
+      _restartIceFailedGraceTimer(_ua.configuration.ice_failed_grace_timeout);
+    }
+    return true;
+  }
+
   /// Zieht die Karenzzeit nach "failed" neu auf und beendet das Gespraech, wenn ICE bis dahin
   /// nicht wieder steht.
   ///

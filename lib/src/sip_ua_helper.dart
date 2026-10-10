@@ -745,6 +745,14 @@ class Call {
     _session.renegotiate(options: options, useUpdate: useUpdate, done: done);
   }
 
+  /// Stoesst einen ICE-Restart per Re-INVITE an (siehe [RTCSession.requestIceRestart]).
+  ///
+  /// @return true, wenn ein Re-INVITE abgesetzt wurde.
+  bool iceRestart() {
+    assert(_session != null, 'ERROR(iceRestart): rtc session is invalid!');
+    return _session.requestIceRestart();
+  }
+
   void sendDTMF(String tones, [Map<String, dynamic>? options]) {
     assert(_session != null, 'ERROR(sendDTMF): rtc session is invalid!');
     _session.sendDTMF(tones, options);
