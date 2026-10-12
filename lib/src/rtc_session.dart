@@ -1257,7 +1257,8 @@ class RTCSession extends EventManager implements Owner {
         _sendReinvite(<String, dynamic>{
           'eventHandlers': handlers,
           'rtcOfferConstraints': rtcOfferConstraints,
-          'extraHeaders': options['extraHeaders']
+          'extraHeaders': options['extraHeaders'],
+          'terminateOnFailure': terminateOnFailure
         });
       }
     }
@@ -3118,9 +3119,11 @@ class RTCSession extends EventManager implements Owner {
     }
   }
 
-  /**
-   * Send Re-INVITE
-   */
+  /// Sendet ein Re-INVITE mit neuem lokalem Angebot.
+  ///
+  /// @param options eventHandlers, rtcOfferConstraints, extraHeaders und
+  ///        terminateOnFailure (Standard true). Bei false fuehren Transportfehler
+  ///        und Timeout nur zu EventCallFailed statt zum Gespraechsende.
   void _sendReinvite([Map<String, dynamic>? options]) async {
     logger.d('sendReinvite()');
 
@@ -3132,6 +3135,9 @@ class RTCSession extends EventManager implements Owner {
     EventManager eventHandlers = options['eventHandlers'] ?? EventManager();
     Map<String, dynamic>? rtcOfferConstraints =
         options['rtcOfferConstraints'] ?? _rtcOfferConstraints;
+    // Bei false (ICE-Restart) beendet ein Transportfehler oder Timeout des Re-INVITE
+    // das Gespraech nicht, sondern meldet nur einen Fehlschlag (siehe renegotiate()).
+    final bool terminateOnFailure = options['terminateOnFailure'] ?? true;
 
     bool succeeded = false;
 
@@ -3209,10 +3215,25 @@ class RTCSession extends EventManager implements Owner {
       handlers.on(EventOnErrorResponse(), (EventOnErrorResponse event) {
         onFailed(event.response);
       });
+      // Feldfall 12.10.2026: Das Gathering des ICE-Restarts dauerte bis zu 2 s; in der
+      // Zeit baute die Anwendung nach einem Netzwechsel den WebSocket neu auf. Das
+      // Re-INVITE traf auf "connecting", der Transportfehler beendete das Gespraech,
+      // obwohl der Dialog den Neuaufbau ueberlebt haette. Ohne terminateOnFailure gilt
+      // ein Transportfehler/Timeout daher nur als gescheitertes Re-INVITE.
       handlers.on(EventOnTransportError(), (EventOnTransportError event) {
+        if (!terminateOnFailure) {
+          logger.w('re-INVITE: transport error, call continues');
+          onFailed();
+          return;
+        }
         onTransportError(); // Do nothing because session ends.
       });
       handlers.on(EventOnRequestTimeout(), (EventOnRequestTimeout event) {
+        if (!terminateOnFailure) {
+          logger.w('re-INVITE: request timeout, call continues');
+          onFailed();
+          return;
+        }
         onRequestTimeout(); // Do nothing because session ends.
       });
       handlers.on(EventOnDialogError(), (EventOnDialogError event) {
