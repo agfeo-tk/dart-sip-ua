@@ -21,6 +21,7 @@ import 'sip_message.dart';
 import 'socket_transport.dart';
 import 'subscriber.dart';
 import 'timers.dart';
+import 'transactions/ack_client.dart';
 import 'transactions/invite_client.dart';
 import 'transactions/invite_server.dart';
 import 'transactions/non_invite_client.dart';
@@ -107,6 +108,16 @@ class UA extends EventManager {
   final Set<Applicant> _applicants = <Applicant>{};
 
   final Map<String?, RTCSession> _sessions = <String?, RTCSession>{};
+
+  // ACKs auf verwaiste 2xx, die bei getrenntem Transport nicht raus konnten.
+  // Schluessel Call-ID + CSeq, Wert: ACK und Verfallszeit (Timer TH der Gegenstelle).
+  final Map<String, _PendingAck> _pendingAcks = <String, _PendingAck>{};
+
+  // Wie lange ein per 1xx bestaetigtes Re-INVITE nach einem Transportabbruch auf seine
+  // finale Antwort wartet. Kurz, weil die Gegenstelle ihre Wiederholungen an den toten
+  // Flow schickt: nur eine schon unterwegs befindliche Antwort kommt noch an. Laenger
+  // wuerde weitere Re-INVITEs (ICE-Restart) unnoetig blockieren.
+  static const Duration _reinviteTransportLossGrace = Duration(seconds: 4);
   SocketTransport? _socketTransport;
   Contact? _contact;
   UAStatus _status = UAStatus.init;
@@ -926,6 +937,8 @@ class UA extends EventManager {
 
     emit(EventSocketConnected(socket: transport.socket));
 
+    _flushPendingAcks();
+
     if (_dynConfiguration!.register!) {
       _registrator.register();
     }
@@ -934,7 +947,14 @@ class UA extends EventManager {
 // Transport disconnected event.
   void onTransportDisconnect(SIPUASocketInterface? socket, ErrorCause cause) {
     // Run _onTransportError_ callback on every client transaction using _transport_.
+    // Ausnahme: bestaetigte Re-INVITEs bleiben kurz bestehen, damit ein spaetes 2xx
+    // noch zugeordnet und bestaetigt werden kann (siehe survivesTransportLoss()).
     _transactions.removeAll().forEach((TransactionBase transaction) {
+      if (transaction is InviteClientTransaction &&
+          transaction.survivesTransportLoss(_reinviteTransportLossGrace)) {
+        _transactions.addTransaction(transaction);
+        return;
+      }
       transaction.onTransportError();
     });
 
@@ -983,6 +1003,8 @@ class UA extends EventManager {
               InviteClientTransaction, message.via_branch!);
           if (transaction != null) {
             transaction.receiveResponse(message.status_code, message);
+          } else {
+            _ackOrphanInvite2xx(message);
           }
           break;
         case SipMethod.ACK:
@@ -998,6 +1020,89 @@ class UA extends EventManager {
       }
     }
   }
+
+  /// Bestaetigt ein 2xx auf ein INVITE, dessen Transaktion schon verworfen ist.
+  ///
+  /// Feldfall 12.10.2026: Ein Transportabbruch loeschte die Transaktion eines
+  /// Re-INVITE (onTransportDisconnect raeumt alle Client-Transaktionen ab), das 200 OK
+  /// kam 12 ms spaeter trotzdem an und wurde verworfen. Ohne ACK beendete die Anlage
+  /// (resip, WaitForAck = 32 s) das Gespraech. RFC 3261 13.2.2.4: jedes 2xx auf ein
+  /// INVITE ist zu bestaetigen. resip ordnet das ACK ueber Call-ID, Tags und CSeq zu,
+  /// unabhaengig vom Flow – es darf also ueber einen neu aufgebauten WebSocket kommen.
+  ///
+  /// @param response Das eingehende 2xx ohne passende Transaktion.
+  void _ackOrphanInvite2xx(IncomingResponse response) {
+    final int? code = response.status_code;
+    if (code == null || code < 200 || code >= 300) {
+      return;
+    }
+    if (response.call_id == null ||
+        response.from_tag == null ||
+        response.to_tag == null ||
+        response.cseq == null) {
+      return;
+    }
+    final Dialog? dialog =
+        _findDialog(response.call_id!, response.from_tag!, response.to_tag!);
+    if (dialog == null) {
+      logger.w('2xx for INVITE without transaction and dialog, ignored '
+          '[cseq:${response.cseq}]');
+      return;
+    }
+    final OutgoingRequest ack = dialog.createAckFor2xx(response.cseq!);
+    if (_socketTransport != null && _socketTransport!.isConnected()) {
+      logger.w('2xx for INVITE without transaction, sending ACK '
+          '[cseq:${response.cseq}]');
+      AckClientTransaction(this, _socketTransport!, ack, EventManager()).send();
+      return;
+    }
+    queueAckUntilReconnect(ack);
+  }
+
+  /// Merkt ein ACK vor, das wegen getrenntem Transport nicht raus konnte, und sendet es
+  /// beim naechsten Verbindungsaufbau (_flushPendingAcks). Frist 64*T1 = 32 s, so lange
+  /// wartet die Gegenstelle (resip WaitForAck = Timer TH) auf das ACK.
+  ///
+  /// @param ack Das ACK; die Via setzt beim Nachsenden die neue AckClientTransaction.
+  void queueAckUntilReconnect(OutgoingRequest ack) {
+    final String key = '${ack.call_id}:${ack.cseq}';
+    if (_pendingAcks.containsKey(key)) {
+      return;
+    }
+    logger.w('transport not connected, ACK queued until reconnect '
+        '[cseq:${ack.cseq}]');
+    _pendingAcks[key] = _PendingAck(
+        ack, DateTime.now().add(Duration(milliseconds: Timers.TIMER_B)));
+  }
+
+  /// Sendet vorgemerkte ACKs nach einem Transport-Neuaufbau, sofern ihre Frist
+  /// noch nicht abgelaufen ist (danach hat die Gegenstelle ohnehin aufgegeben).
+  void _flushPendingAcks() {
+    if (_pendingAcks.isEmpty || _socketTransport == null) {
+      return;
+    }
+    final DateTime now = DateTime.now();
+    final List<_PendingAck> pending = _pendingAcks.values.toList();
+    _pendingAcks.clear();
+    for (final _PendingAck p in pending) {
+      if (now.isAfter(p.expires)) {
+        logger.w('queued ACK expired, dropped [cseq:${p.ack.cseq}]');
+        continue;
+      }
+      logger.w('sending queued ACK after reconnect [cseq:${p.ack.cseq}]');
+      AckClientTransaction(this, _socketTransport!, p.ack, EventManager(),
+              queueOnFailure: false)
+          .send();
+    }
+  }
+}
+
+/// Vorgemerktes ACK auf ein verwaistes 2xx mit Verfallszeit.
+class _PendingAck {
+  _PendingAck(this.ack, this.expires);
+
+  final OutgoingRequest ack;
+  final DateTime expires;
 }
 
 mixin Applicant {

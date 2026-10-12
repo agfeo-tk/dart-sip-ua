@@ -169,6 +169,25 @@ class Dialog {
   }
 
   // RFC 3261 12.2.1.1.
+  /// Baut ein ACK auf ein 2xx mit fester CSeq, unabhaengig von local_seqnum.
+  ///
+  /// Gebraucht, wenn die INVITE-Transaktion schon verworfen ist (Transportabbruch)
+  /// und das 2xx trotzdem noch eintrifft; local_seqnum kann dann schon weiter sein.
+  ///
+  /// @param cseq CSeq des bestaetigten INVITE.
+  /// @return Das ACK, noch ohne Via (setzt die AckClientTransaction).
+  OutgoingRequest createAckFor2xx(int cseq) {
+    return OutgoingRequest(SipMethod.ACK, _remote_target, _ua, <String, dynamic>{
+      'cseq': cseq,
+      'call_id': _id!.call_id,
+      'from_uri': _local_uri,
+      'from_tag': _id!.local_tag,
+      'to_uri': _remote_uri,
+      'to_tag': _id!.remote_tag,
+      'route_set': _route_set
+    });
+  }
+
   OutgoingRequest _createRequest(
       SipMethod method, List<dynamic> extraHeaders, String? body) {
     extraHeaders = Utils.cloneArray(extraHeaders);

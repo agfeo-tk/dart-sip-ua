@@ -33,6 +33,10 @@ class InviteClientTransaction extends TransactionBase {
 
   Timer? B, D, M;
 
+  // Laeuft, solange die Transaktion einen Transportabbruch ueberbrueckt
+  // (siehe survivesTransportLoss()).
+  Timer? _transportLossTimer;
+
   void stateChanged(TransactionState state) {
     this.state = state;
     emit(EventStateChanged());
@@ -50,11 +54,42 @@ class InviteClientTransaction extends TransactionBase {
     }
   }
 
+  /// Prueft beim Transportabbruch, ob die Transaktion bestehen bleiben darf.
+  ///
+  /// Nur Re-INVITEs (To-Tag vorhanden) im Zustand PROCEEDING: Die Gegenstelle hat das
+  /// INVITE per 1xx bestaetigt, ihr 2xx kann noch unterwegs sein oder ueber den neu
+  /// aufgebauten WebSocket ankommen. Feldfall 12.10.2026: das 200 OK traf 12 ms nach dem
+  /// Abbruch ein, die Transaktion war schon verworfen, ohne ACK beendete die Anlage das
+  /// Gespraech. Kommt binnen [grace] keine finale Antwort, endet die Transaktion wie
+  /// bisher mit einem Transportfehler (blockiert sonst weitere Re-INVITEs).
+  ///
+  /// @param grace Wartezeit auf eine finale Antwort.
+  /// @return true, wenn die Transaktion bestehen bleibt.
+  bool survivesTransportLoss(Duration grace) {
+    final bool inDialog =
+        (request as OutgoingRequest?)?.to?.hasParam('tag') ?? false;
+    if (state != TransactionState.PROCEEDING || !inDialog) {
+      return false;
+    }
+    logger.w('transport lost, keeping in-dialog INVITE transaction $id '
+        'for ${grace.inMilliseconds} ms');
+    clearTimeout(_transportLossTimer);
+    _transportLossTimer = setTimeout(() {
+      if (state == TransactionState.PROCEEDING) {
+        logger.w('no final response after transport loss, '
+            'dropping transaction $id');
+        onTransportError();
+      }
+    }, grace.inMilliseconds);
+    return true;
+  }
+
   @override
   void onTransportError() {
     clearTimeout(B);
     clearTimeout(D);
     clearTimeout(M);
+    clearTimeout(_transportLossTimer);
 
     if (state != TransactionState.ACCEPTED) {
       logger.d('transport error occurred, deleting transaction $id');

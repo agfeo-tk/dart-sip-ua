@@ -8,9 +8,14 @@ import '../utils.dart';
 import 'transaction_base.dart';
 
 class AckClientTransaction extends TransactionBase {
+  /// @param queueOnFailure Bei getrenntem Transport das ACK bis zum Neuaufbau
+  ///        vormerken (UA.queueAckUntilReconnect). false beim Nachsenden selbst.
   AckClientTransaction(UA ua, SocketTransport transport,
-      OutgoingRequest request, EventManager eventHandlers) {
+      OutgoingRequest request, EventManager eventHandlers,
+      {bool queueOnFailure = true}) {
     id = 'z9hG4bK${(Math.random() * 10000000).floor()}';
+    _ua = ua;
+    _queueOnFailure = queueOnFailure;
     this.transport = transport;
     this.request = request;
     _eventHandlers = eventHandlers;
@@ -23,10 +28,18 @@ class AckClientTransaction extends TransactionBase {
   }
 
   late EventManager _eventHandlers;
+  late UA _ua;
+  late bool _queueOnFailure;
 
+  /// Sendet das ACK. Ist der Transport gerade getrennt (Neuaufbau nach Netzwechsel),
+  /// wird es vorgemerkt und nach dem Reconnect nachgesendet: die Gegenstelle wartet
+  /// bis zu 32 s auf das ACK zu ihrem 2xx und beendet sonst das Gespraech.
   @override
   void send() {
     if (!transport!.send(request)) {
+      if (_queueOnFailure && !transport!.isConnected()) {
+        _ua.queueAckUntilReconnect(request as OutgoingRequest);
+      }
       onTransportError();
     }
   }
